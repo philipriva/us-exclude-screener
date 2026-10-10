@@ -1,0 +1,21 @@
+name: Daily Exclude Screener
+
+on:
+  schedule:
+    # 美股收市後約 2–2.5 小時（夏令 22:30 UTC = 香港約 06:30）
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run exclude screener
+        run: python run_exclude.py
