@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""GitHub Actions headless: 唔考慮篩選（預設同 mcdx_exclude app）"""
+"""GitHub Actions headless: 唔考慮篩選（預設同 mcdx_exclude app）
+
+OR exclude legs include: MCDX, close<EMA200/50, mcap<100M, daily TD S2,
+weekly TD S1/S2, weekly 主力能量 bear>bull, weekly KDJ yellow (J crossunder 50),
+monthly KDJ yellow (J crossunder 50).
+"""
 from __future__ import annotations
 
 import io
@@ -82,6 +87,64 @@ def to_weekly(d: pd.DataFrame) -> pd.DataFrame:
     if v is not None:
         w["Volume"] = v
     return w.dropna(subset=["Close", "High", "Low"])
+
+
+def to_monthly(d: pd.DataFrame) -> pd.DataFrame:
+    x = d.copy()
+    x.index = pd.to_datetime(x.index)
+    o = x["Open"].resample("ME").first()
+    h = x["High"].resample("ME").max()
+    l = x["Low"].resample("ME").min()
+    c = x["Close"].resample("ME").last()
+    v = x["Volume"].resample("ME").sum() if "Volume" in x.columns else None
+    m = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c})
+    if v is not None:
+        m["Volume"] = v
+    return m.dropna(subset=["Close", "High", "Low"])
+
+
+def drop_forming_monthly(m: pd.DataFrame) -> pd.DataFrame:
+    """Drop incomplete current month before month-end / before NY close-ish."""
+    if m.empty:
+        return m
+    now = ny_now()
+    last = pd.Timestamp(m.index[-1])
+    # Still in the calendar month of the last bar, and not yet past that month's
+    # last calendar day close: treat as forming until next month starts (or after
+    # last day 16:15 ET). Month-end bar label is month-end date.
+    month_end = (last + pd.offsets.MonthEnd(0)).date()
+    if now.date() < month_end:
+        return m.iloc[:-1] if len(m) > 1 else m
+    if now.date() == month_end and (now.hour, now.minute) < (16, 15):
+        return m.iloc[:-1] if len(m) > 1 else m
+    return m
+
+
+def kdj_j(df: pd.DataFrame) -> pd.Series:
+    """Tongdaxin KDJ (9,3,3) J line using CN recursive SMA."""
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
+    c = df["Close"].astype(float)
+    llv = l.rolling(9, min_periods=9).min()
+    hhv = h.rolling(9, min_periods=9).max()
+    rng = hhv - llv
+    rsv = ((c - llv) / rng.replace(0, pd.NA) * 100).fillna(0)
+    k = sma_cn(rsv, 3)
+    d = sma_cn(k, 3)
+    return 3 * k - 2 * d
+
+
+def kdj_yellow(df: pd.DataFrame) -> bool:
+    """True if last completed bar is yellow: J crossunder 50 (prev>=50, curr<50)."""
+    if df is None or len(df) < 15:
+        return False
+    j = kdj_j(df)
+    if len(j) < 2:
+        return False
+    prev, curr = j.iloc[-2], j.iloc[-1]
+    if pd.isna(prev) or pd.isna(curr):
+        return False
+    return float(prev) >= 50.0 and float(curr) < 50.0
 
 
 def sma_cn(src: pd.Series, length: int) -> pd.Series:
@@ -196,7 +259,7 @@ def download(syms: list[str]) -> dict[str, pd.DataFrame]:
         for a in range(3):
             try:
                 raw = yf.download(
-                    bt, period="2y", interval="1d", group_by="ticker",
+                    bt, period="5y", interval="1d", group_by="ticker",
                     auto_adjust=False, threads=True, progress=False,
                 )
                 break
@@ -253,7 +316,8 @@ def exclude_hit(d: pd.DataFrame) -> bool:
     if td_match(pd.DataFrame({"Close": c}), DEFAULT_TD_D):
         return True
 
-    w = drop_forming_weekly(to_weekly(pd.DataFrame({"Open": d["Open"], "High": h, "Low": l, "Close": c, "Volume": d.get("Volume", c * 0)})))
+    ohlc_w = pd.DataFrame({"Open": d["Open"], "High": h, "Low": l, "Close": c, "Volume": d.get("Volume", c * 0)})
+    w = drop_forming_weekly(to_weekly(ohlc_w))
     if len(w) >= 10:
         # 6 weekly TD S1/S2
         if td_match(w, DEFAULT_TD_W):
@@ -261,6 +325,14 @@ def exclude_hit(d: pd.DataFrame) -> bool:
         # 7 zhuli
         if zhuli_bear_gt_bull(w):
             return True
+        # 8 weekly KDJ yellow (J crossunder 50)
+        if kdj_yellow(w):
+            return True
+
+    # 9 monthly KDJ yellow (J crossunder 50)
+    m = drop_forming_monthly(to_monthly(ohlc_w))
+    if kdj_yellow(m):
+        return True
     return False
 
 
