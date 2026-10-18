@@ -76,7 +76,11 @@ def write_all_gates(
             print(f"Sheets: no id for {key}, skip", flush=True)
             continue
         sh = gc.open_by_key(sid)
-        ws = _first_worksheet(sh)
+        tab = meta.get("tab") or "hits"
+        try:
+            ws = sh.worksheet(tab)
+        except Exception:
+            ws = _first_worksheet(sh)
         rows = [["symbol"]] + [[s] for s in syms]
         print(f"Sheets: write {meta.get('title', key)} n={len(syms)}", flush=True)
         _clear_and_write(ws, rows)
