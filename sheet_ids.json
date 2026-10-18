@@ -1,0 +1,71 @@
+{
+  "folder_id": "1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A",
+  "folder_url": "https://drive.google.com/drive/folders/1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A",
+  "combine": {
+    "id": "1PZ2n3j2uvLCZdkp1RD9F-XNfpw_v3-oULntXJ8UIkMA",
+    "title": "us_exclude_screener",
+    "tab": "combine"
+  },
+  "gates": {
+    "01_mcdx": {
+      "id": "1qHPX1CoryzA3-GCIw_IZDyp4DM7HAxr6GyPMqrb2OyE",
+      "title": "exclude_01_mcdx",
+      "label": "日線 MCDX 籌碼",
+      "tab": "hits"
+    },
+    "02_ema200": {
+      "id": "1Isv9BKq9cEuHAAFGdZLmi48dAtaPj2P07b8n30GiO8A",
+      "title": "exclude_02_ema200",
+      "label": "日線 close < EMA200",
+      "tab": "hits"
+    },
+    "03_ema50": {
+      "id": "1fmc4S7-uaZuhl4gUnbIvX3jd1GN6O3Fk-EAq8YBmDnQ",
+      "title": "exclude_03_ema50",
+      "label": "日線 close < EMA50",
+      "tab": "hits"
+    },
+    "04_mcap": {
+      "id": "1H2jv0n5zVtx7Y6SXT5ypiA7NgkQaurfJwzoRS0jx2gw",
+      "title": "exclude_04_mcap",
+      "label": "市值 < 100M",
+      "tab": "hits"
+    },
+    "05_td_daily": {
+      "id": "1QPdh0BbUwpECwqdmtx_Ny_no_EM_pWZ6SLnsJNWCXSo",
+      "title": "exclude_05_td_daily",
+      "label": "日線 TD Sequential",
+      "tab": "hits"
+    },
+    "06_td_weekly": {
+      "id": "12RfA-RghDs27VzM_JQVZWWXqga3BEDkbSOLSIDnZd04",
+      "title": "exclude_06_td_weekly",
+      "label": "週線 TD Sequential",
+      "tab": "hits"
+    },
+    "07_zhuli": {
+      "id": "1H4uKJaKNZDfy7SBmp-YaMiedKNmxlJuR9OpAHJcfJ3Q",
+      "title": "exclude_07_zhuli",
+      "label": "週線主力能量",
+      "tab": "hits"
+    },
+    "08_kdj_weekly": {
+      "id": "1oEV83LXTORe_DOYaDVVBwcnyt1sblZx2YNiOGkpLffo",
+      "title": "exclude_08_kdj_weekly",
+      "label": "週線 KDJ 黃柱",
+      "tab": "hits"
+    },
+    "09_kdj_monthly": {
+      "id": "1trJecD96UPO2HN8Xdqn6RNhgZgsLR-jUlFdGI3r4DOo",
+      "title": "exclude_09_kdj_monthly",
+      "label": "月線 KDJ 黃柱",
+      "tab": "hits"
+    },
+    "10_sar_monthly": {
+      "id": "1DLInf-c1UPV6GxAsvaHwLwUpDk6RxzVskl0xJzqeAlQ",
+      "title": "exclude_10_sar_monthly",
+      "label": "月線 SAR 喺價上",
+      "tab": "hits"
+    }
+  }
+}

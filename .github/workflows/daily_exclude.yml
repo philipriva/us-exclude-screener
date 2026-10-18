@@ -1,14 +1,15 @@
-name: Daily Exclude Screener
+name: Daily Exclude Screener (10 gates → Sheets)
 
 on:
   schedule:
-    - cron: "30 22 * * 1-5"
+    # 01:00 UTC Tue–Sat ≈ after US cash close Mon–Fri (same as fundflow tips)
+    - cron: "0 1 * * 2-6"
   workflow_dispatch:
 
 jobs:
   screen:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,11 +17,14 @@ jobs:
           python-version: "3.12"
       - name: Install deps
         run: pip install -r requirements.txt
-      - name: Run exclude screener
-        run: python run_exclude.py
-      - name: Upload exclude_symbols.txt
+      - name: Run 10-gate exclude screener
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python run_exclude.py --out-dir out
+      - name: Upload gate artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: exclude_symbols
-          path: exclude_symbols.txt
-          retention-days: 7
+          name: exclude_gates
+          path: |
+            out/
+          retention-days: 14
