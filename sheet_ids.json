@@ -2,70 +2,78 @@
   "folder_id": "1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A",
   "folder_url": "https://drive.google.com/drive/folders/1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A",
   "combine": {
-    "id": "1PZ2n3j2uvLCZdkp1RD9F-XNfpw_v3-oULntXJ8UIkMA",
+    "id": "1M9Jpkylzru6UViTvpNjlDhpXs3FwKMNN5bNg9O_wHPs",
     "title": "us_exclude_screener",
-    "tab": "combine"
+    "tab": "combine",
+    "url": "https://docs.google.com/spreadsheets/d/1M9Jpkylzru6UViTvpNjlDhpXs3FwKMNN5bNg9O_wHPs/edit"
   },
   "gates": {
     "01_mcdx": {
-      "id": "1qHPX1CoryzA3-GCIw_IZDyp4DM7HAxr6GyPMqrb2OyE",
+      "id": "1vci688aOjzHmwnENNBUYyHOclkRauVvuu0qWGajxVz0",
       "title": "exclude_01_mcdx",
       "label": "日線 MCDX 籌碼",
-      "tab": "hits"
+      "tab": "exclude_01_mcdx"
     },
     "02_ema200": {
-      "id": "1Isv9BKq9cEuHAAFGdZLmi48dAtaPj2P07b8n30GiO8A",
+      "id": "1SR7pr3YtELnLQkr38GlRyq-Yan9qK5MaLZq4AiSa3T0",
       "title": "exclude_02_ema200",
       "label": "日線 close < EMA200",
-      "tab": "hits"
+      "tab": "exclude_02_ema200"
     },
     "03_ema50": {
-      "id": "1fmc4S7-uaZuhl4gUnbIvX3jd1GN6O3Fk-EAq8YBmDnQ",
+      "id": "1xIkCZVPgmE8aGfXa00ieG6f2vOLh3YPNvim9dqVJsPk",
       "title": "exclude_03_ema50",
       "label": "日線 close < EMA50",
-      "tab": "hits"
+      "tab": "exclude_03_ema50"
     },
     "04_mcap": {
-      "id": "1H2jv0n5zVtx7Y6SXT5ypiA7NgkQaurfJwzoRS0jx2gw",
+      "id": "11FcPud9FfCKIJSjkTEyam4N3eBXZNRjYJ9duGbtQTMY",
       "title": "exclude_04_mcap",
       "label": "市值 < 100M",
-      "tab": "hits"
+      "tab": "exclude_04_mcap"
     },
     "05_td_daily": {
-      "id": "1QPdh0BbUwpECwqdmtx_Ny_no_EM_pWZ6SLnsJNWCXSo",
+      "id": "1KzLFoQmK6AnOBB4ub9DLOJcPG69gk06RW_-UxNFAxBA",
       "title": "exclude_05_td_daily",
       "label": "日線 TD Sequential",
-      "tab": "hits"
+      "tab": "exclude_05_td_daily"
     },
     "06_td_weekly": {
-      "id": "12RfA-RghDs27VzM_JQVZWWXqga3BEDkbSOLSIDnZd04",
+      "id": "1VS53Ae3-DddOmJlffYWNbkZncBcQ8Sn_fno-l5aEzjs",
       "title": "exclude_06_td_weekly",
       "label": "週線 TD Sequential",
-      "tab": "hits"
+      "tab": "exclude_06_td_weekly"
     },
     "07_zhuli": {
-      "id": "1H4uKJaKNZDfy7SBmp-YaMiedKNmxlJuR9OpAHJcfJ3Q",
+      "id": "14wzhunQImWiqvU1MSEXgXL9k8szL5_WhEjiTx5ykQlQ",
       "title": "exclude_07_zhuli",
       "label": "週線主力能量",
-      "tab": "hits"
+      "tab": "exclude_07_zhuli"
     },
     "08_kdj_weekly": {
-      "id": "1oEV83LXTORe_DOYaDVVBwcnyt1sblZx2YNiOGkpLffo",
+      "id": "1Ai6NHjosaOksjvOe4yvhGcOGxqEcsmu3M7mzAOyLk2s",
       "title": "exclude_08_kdj_weekly",
       "label": "週線 KDJ 黃柱",
-      "tab": "hits"
+      "tab": "exclude_08_kdj_weekly"
     },
     "09_kdj_monthly": {
-      "id": "1trJecD96UPO2HN8Xdqn6RNhgZgsLR-jUlFdGI3r4DOo",
+      "id": "1mIXjO7C2SK-iFUz53VX78Mk98BUccYOzPcFQNZXnFCo",
       "title": "exclude_09_kdj_monthly",
       "label": "月線 KDJ 黃柱",
-      "tab": "hits"
+      "tab": "exclude_09_kdj_monthly"
     },
     "10_sar_monthly": {
-      "id": "1DLInf-c1UPV6GxAsvaHwLwUpDk6RxzVskl0xJzqeAlQ",
+      "id": "1QSZ_n0E6j23nNMP2MIpYSSuwxwDolfP2PoAC4GBWP24",
       "title": "exclude_10_sar_monthly",
       "label": "月線 SAR 喺價上",
-      "tab": "hits"
+      "tab": "exclude_10_sar_monthly"
     }
+  },
+  "notes": {
+    "asof_et": "2026-10-18 16:25 ET",
+    "combine_rows": 27172,
+    "unique_symbols": 7278,
+    "mcap_hits": 0,
+    "mcap_note": "Yahoo crumb/401 during overnight mcap pass → 0 hits; re-run after SA/Actions or locally when Yahoo OK"
   }
 }

@@ -62,3 +62,9 @@ python run_exclude.py --out-dir out
 ## 公式來源
 
 `us_exclude_screener_app.pyw`（桌面「開啟唔考慮篩選」）。
+
+
+## Overnight first populate (2026-10-19 HKT)
+
+Full Nasdaq Trader universe was scanned locally and uploaded into `GROK/github` as native Sheets (see `sheet_ids.json`).  
+**市值 &lt; 100M** returned **0** hits that night because Yahoo Finance returned crumb/401 during the mcap pass — re-run the workflow after adding the SA secret (or local with working Yahoo) to refresh gate 4.
