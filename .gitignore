@@ -12,3 +12,13 @@ _duplicate_rows.json
 _dup_docs.json
 _dup_chunks/
 _dup_mcp_args/
+_dup_vals/
+_dup_vals_*.json
+_dup_chunks/
+_dup_mcp_args/
+_duplicate_rows.json
+_combine_export.csv
+_dup_docs.json
+out/
+out_gate11/
+__pycache__/

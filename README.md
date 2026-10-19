@@ -1,8 +1,8 @@
-# US Exclude Screener（唔考慮 — 10 閘分開跑）
+# US Exclude Screener（唔考慮 — 11 閘分開跑）
 
-收市後自動跑 `us_exclude_screener_app.pyw` 嘅 **10 條 OR 閘**（各自獨立），寫入 Google Drive **`GROK/github`** 入面 **10 個 spreadsheet**，再更新合併表 **`us_exclude_screener`**（tab `combine`：A=symbol，B=閘名）。
+收市後自動跑 `us_exclude_screener_app.pyw` 嘅 **11 條 OR 閘**（各自獨立），寫入 Google Drive **`GROK/github`** 入面 **11 個 spreadsheet**，再更新合併表 **`us_exclude_screener`**（tab `combine`：A=symbol，B=閘名；tab `Duplicate`：每隻股一行，B 欄閘名按重視排名串）。
 
-## 十條閘（預設同桌面 app）
+## 十一條閘（預設同桌面 app）
 
 | # | Sheet | 閘標籤（combine 欄 B） | 規則 |
 |---|-------|------------------------|------|
@@ -16,10 +16,11 @@
 | 8 | `exclude_08_kdj_weekly` | 週線 KDJ 黃柱 | KDJ(9,3,3) J 由 ≥50 跌穿 50 |
 | 9 | `exclude_09_kdj_monthly` | 月線 KDJ 黃柱 | 同上；**只用已收市月** |
 | 10 | `exclude_10_sar_monthly` | 月線 SAR 喺價上 | TV `ta.sar(0.02,0.02,0.2)`；`close&lt;SAR`；**含未收市月** |
+| 11 | `exclude_11_zhuli_monthly` | 月線主力能量 | 做空線 &gt; 做多線（同閘7）；**只用已收市月** |
 
 - **宇宙**：Nasdaq Trader 全美（含 ETF／Fund）；剔測試／`$`／`^`
 - **價**：Yahoo `auto_adjust=True`
-- **未收市日／週 K**：閘 1–8 預設丟掉（美東 16:15 前）
+- **未收市日／週 K**：閘 1–8 預設丟掉（美東 16:15 前）；閘 9／11 用已收市月；閘 10 含未收市月
 - **未做**：月線綠帶（赚钱轨道）
 
 ## Drive

@@ -5,7 +5,8 @@
     "id": "1M9Jpkylzru6UViTvpNjlDhpXs3FwKMNN5bNg9O_wHPs",
     "title": "us_exclude_screener",
     "tab": "combine",
-    "url": "https://docs.google.com/spreadsheets/d/1M9Jpkylzru6UViTvpNjlDhpXs3FwKMNN5bNg9O_wHPs/edit"
+    "url": "https://docs.google.com/spreadsheets/d/1M9Jpkylzru6UViTvpNjlDhpXs3FwKMNN5bNg9O_wHPs/edit",
+    "duplicate_tab": "Duplicate"
   },
   "gates": {
     "01_mcdx": {
@@ -67,6 +68,13 @@
       "title": "exclude_10_sar_monthly",
       "label": "月線 SAR 喺價上",
       "tab": "exclude_10_sar_monthly"
+    },
+    "11_zhuli_monthly": {
+      "id": "1mDXjxBprbV4FU1wvpeGRkwFOz1pgnCKpHCAvfBD54K8",
+      "title": "exclude_11_zhuli_monthly",
+      "label": "月線主力能量",
+      "tab": "exclude_11_zhuli_monthly",
+      "url": "https://docs.google.com/spreadsheets/d/1mDXjxBprbV4FU1wvpeGRkwFOz1pgnCKpHCAvfBD54K8/edit"
     }
   },
   "notes": {

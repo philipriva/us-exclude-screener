@@ -1,4 +1,4 @@
-name: Daily Exclude Screener (10 gates → Sheets)
+name: Daily Exclude Screener (11 gates → Sheets)
 
 on:
   schedule:
@@ -21,7 +21,7 @@ jobs:
           python-version: "3.12"
       - name: Install deps
         run: pip install -r requirements.txt
-      - name: Run 10-gate exclude screener
+      - name: Run 11-gate exclude screener
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python run_exclude.py --out-dir out

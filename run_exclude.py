@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""GitHub Actions / CLI: 唔考慮篩選 — 10 gates run separately → Sheets + combine.
+"""GitHub Actions / CLI: 唔考慮篩選 — 11 gates run separately → Sheets + combine.
 
 Formulas match us_exclude_screener_app.pyw (defaults):
 1. 日線 MCDX 籌碼 — SMA10(PC)<SMA10(LC)
@@ -13,9 +13,10 @@ Formulas match us_exclude_screener_app.pyw (defaults):
 8. 週線 KDJ 黃柱 — J crossunder 50
 9. 月線 KDJ 黃柱 — completed month only
 10. 月線 SAR 喺價上 — TV ta.sar; include forming month
+11. 月線主力能量 — 做空 > 做多 (same Tongdaxin as weekly; completed month)
 
 Universe: Nasdaq Trader US incl. ETF/Fund. Yahoo auto_adjust=True.
-Default: drop forming daily/weekly bars (gates 1–8); gate 9 completed month;
+Default: drop forming daily/weekly bars (gates 1–8); gates 9+11 completed month;
 gate 10 includes forming month.
 """
 from __future__ import annotations
@@ -54,6 +55,7 @@ GATE_ORDER = [
     "08_kdj_weekly",
     "09_kdj_monthly",
     "10_sar_monthly",
+    "11_zhuli_monthly",
 ]
 
 GATE_LABELS = {
@@ -67,7 +69,23 @@ GATE_LABELS = {
     "08_kdj_weekly": "週線 KDJ 黃柱",
     "09_kdj_monthly": "月線 KDJ 黃柱",
     "10_sar_monthly": "月線 SAR 喺價上",
+    "11_zhuli_monthly": "月線主力能量",
 }
+
+# Duplicate tab B-column join order (1 = leftmost / highest priority)
+DUP_GATE_PRIORITY = [
+    "月線主力能量",
+    "週線主力能量",
+    "月線 SAR 喺價上",
+    "日線 MCDX 籌碼",
+    "月線 KDJ 黃柱",
+    "週線 KDJ 黃柱",
+    "市值 < 100M",
+    "日線 close < EMA200",
+    "日線 close < EMA50",
+    "週線 TD Sequential",
+    "日線 TD Sequential",
+]
 
 
 def _dir(url: str) -> pd.DataFrame:
@@ -432,7 +450,7 @@ def download(syms: list[str]) -> dict[str, pd.DataFrame]:
 
 
 def eval_gates(d: pd.DataFrame, forming: bool = False) -> dict[str, bool]:
-    """Evaluate price gates 1–3,5–10 (not mcap). Keys = GATE_ORDER without 04_mcap."""
+    """Evaluate price gates 1–3,5–11 (not mcap). Keys = GATE_ORDER without 04_mcap."""
     hits = {k: False for k in GATE_ORDER if k != "04_mcap"}
     if d is None or d.empty:
         return hits
@@ -484,7 +502,7 @@ def eval_gates(d: pd.DataFrame, forming: bool = False) -> dict[str, bool]:
         if kdj_yellow(w):
             hits["08_kdj_weekly"] = True
 
-    # monthly 9 (completed) + 10 (forming included)
+    # monthly 9+11 (completed) + 10 (forming included)
     m_all = to_monthly(dd)
     m_done = drop_forming_monthly(m_all) if not forming else m_all
     if m_done is not None and not m_done.empty and kdj_yellow(m_done):
@@ -492,6 +510,8 @@ def eval_gates(d: pd.DataFrame, forming: bool = False) -> dict[str, bool]:
     m_sar = m_all if (m_all is not None and len(m_all) >= 3) else m_done
     if m_sar is not None and not m_sar.empty and monthly_sar_above_close(m_sar):
         hits["10_sar_monthly"] = True
+    if m_done is not None and not m_done.empty and zhuli_bear_gt_bull(m_done):
+        hits["11_zhuli_monthly"] = True
 
     return hits
 
@@ -545,11 +565,14 @@ def maybe_write_sheets(gate_hits: dict[str, list[str]], sheet_ids_path: Path) ->
         print("Sheets: sheets_writer import failed", flush=True)
         return
     cfg = json.loads(sheet_ids_path.read_text(encoding="utf-8"))
-    write_all_gates(sa_json, cfg, gate_hits, GATE_LABELS, GATE_ORDER)
+    write_all_gates(
+        sa_json, cfg, gate_hits, GATE_LABELS, GATE_ORDER,
+        dup_priority=DUP_GATE_PRIORITY,
+    )
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="US exclude screener — 10 separate gates")
+    ap = argparse.ArgumentParser(description="US exclude screener — 11 separate gates")
     ap.add_argument("--symbols", default="", help="Comma/space symbols; empty=full universe")
     ap.add_argument("--forming", action="store_true", help="Include forming daily bar")
     ap.add_argument("--out-dir", default="out", help="Local output directory")

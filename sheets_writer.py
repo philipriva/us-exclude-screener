@@ -18,7 +18,8 @@ DUP_FORMULA_DOC = (
 )
 DUP_NOTE_DOC = (
     "Sheets calc limit on full MAP→values materialized; "
-    "regenerate on each screener upload."
+    "regenerate on each screener upload. "
+    "B sorted by Philip priority: 月線主力>週線主力>月線SAR>MCDX>…"
 )
 
 
@@ -67,8 +68,33 @@ def _clear_and_write(ws, rows: list[list[Any]]) -> None:
         time.sleep(0.4)
 
 
-def _aggregate_duplicate(combine_rows: list[list[str]]) -> list[list[str]]:
-    """One row per symbol (first-seen order); B = gates joined ', ' (appearance order).
+DEFAULT_DUP_PRIORITY = [
+    "月線主力能量",
+    "週線主力能量",
+    "月線 SAR 喺價上",
+    "日線 MCDX 籌碼",
+    "月線 KDJ 黃柱",
+    "週線 KDJ 黃柱",
+    "市值 < 100M",
+    "日線 close < EMA200",
+    "日線 close < EMA50",
+    "週線 TD Sequential",
+    "日線 TD Sequential",
+]
+
+
+def _sort_gates(gates: list[str], priority: list[str] | None = None) -> list[str]:
+    pri = priority or DEFAULT_DUP_PRIORITY
+    rank = {g: i for i, g in enumerate(pri)}
+    # known first by priority; unknown last, stable by name
+    return sorted(gates, key=lambda g: (rank.get(g, 10_000), g))
+
+
+def _aggregate_duplicate(
+    combine_rows: list[list[str]],
+    priority: list[str] | None = None,
+) -> list[list[str]]:
+    """One row per symbol (first-seen order); B = gates joined ', ' by priority.
 
     combine_rows may include header ["symbol","gate"]; data rows are [symbol, gate].
     """
@@ -83,7 +109,7 @@ def _aggregate_duplicate(combine_rows: list[list[str]]) -> list[list[str]]:
             od[sym] = []
         if gate and gate not in od[sym]:
             od[sym].append(gate)
-    return [[s, ", ".join(gates)] for s, gates in od.items()]
+    return [[s, ", ".join(_sort_gates(gates, priority))] for s, gates in od.items()]
 
 
 def _ensure_worksheet(sh, title: str):
@@ -96,8 +122,13 @@ def _ensure_worksheet(sh, title: str):
             return _first_worksheet(sh)
 
 
-def _write_duplicate(sh, combine_rows: list[list[str]], tab: str = "Duplicate") -> None:
-    dup_rows = _aggregate_duplicate(combine_rows)
+def _write_duplicate(
+    sh,
+    combine_rows: list[list[str]],
+    tab: str = "Duplicate",
+    priority: list[str] | None = None,
+) -> None:
+    dup_rows = _aggregate_duplicate(combine_rows, priority=priority)
     ws = _ensure_worksheet(sh, tab)
     # Clear A:B (and leave room); then write values + docs in D
     try:
@@ -143,6 +174,7 @@ def write_all_gates(
     gate_hits: dict[str, list[str]],
     labels: dict[str, str],
     order: list[str],
+    dup_priority: list[str] | None = None,
 ) -> None:
     gc = _client(sa_json)
     combine_rows: list[list[str]] = [["symbol", "gate"]]
@@ -187,5 +219,5 @@ def write_all_gates(
         _clear_and_write(ws, combine_rows)
         # Refresh Duplicate on same spreadsheet (us_exclude_screener)
         dup_tab = comb.get("duplicate_tab") or "Duplicate"
-        _write_duplicate(sh, combine_rows, tab=dup_tab)
+        _write_duplicate(sh, combine_rows, tab=dup_tab, priority=dup_priority)
     print("Sheets: done", flush=True)
