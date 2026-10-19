@@ -29,8 +29,12 @@ IDs 見 `sheet_ids.json`（已預建空表；Actions／本地有 SA 會覆寫內
 
 ## GitHub Actions
 
-- **排程**：`cron: 0 1 * * 2-6`（UTC）≈ 美東 Mon–Fri 收市後 4–5 小時  
-- **手動**：Actions → *Daily Exclude Screener* → Run workflow  
+- **排程**：`cron: 0 6 * * 2-6`（UTC，Tue–Sat）
+  - **對應美股**：Mon–Fri 常規收市（16:00 ET）之後約 **9–10 小時**
+  - **美東**：約 **02:00 EDT**／**01:00 EST**（下一個交易日 09:30 ET 開市前仍有充足時間）
+  - **香港（HKT）**：約 **14:00**（Tue–Sat）
+  - **點解唔用更早（例如 01:00 UTC）**：收市後 4–5 小時 Yahoo 日線／市值有時仍未穩；凌晨段通常較齊，跑完亦一定喺下個開市前
+- **手動**：Actions → *Daily Exclude Screener* → Run workflow（`workflow_dispatch`）
 - **Artifact**：`exclude_gates`（`out/` 入面每閘 `.txt`／`.csv` + combine），保留 14 日
 
 ### 必設 Secret（Sheets 寫入）

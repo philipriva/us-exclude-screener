@@ -2,8 +2,12 @@ name: Daily Exclude Screener (10 gates → Sheets)
 
 on:
   schedule:
-    # 01:00 UTC Tue–Sat ≈ after US cash close Mon–Fri (same as fundflow tips)
-    - cron: "0 1 * * 2-6"
+    # After US cash close Mon–Fri, when Yahoo daily bars are usually settled.
+    # 06:00 UTC Tue–Sat =
+    #   ET: 02:00 EDT / 01:00 EST (~9–10h after 16:00 ET close; before next 09:30 ET open)
+    #   HKT: 14:00 Tue–Sat
+    # Earlier 01:00 UTC (~21:00/20:00 ET) is also after close but Yahoo is often still catching up.
+    - cron: "0 6 * * 2-6"
   workflow_dispatch:
 
 jobs:
