@@ -22,3 +22,5 @@ _dup_docs.json
 out/
 out_gate11/
 __pycache__/
+_g11_vals/
+_comb_vals/
