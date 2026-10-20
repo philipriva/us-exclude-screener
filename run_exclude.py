@@ -11,13 +11,13 @@ Formulas match us_exclude_screener_app.pyw (defaults):
 6. 週線 TD Sequential — S1+S2
 7. 週線主力能量 — 做空 > 做多
 8. 週線 KDJ 黃柱 — J crossunder 50
-9. 月線 KDJ 黃柱 — completed month only
-10. 月線 SAR 喺價上 — TV ta.sar; include forming month
-11. 月線主力能量 — 做空 > 做多 (same Tongdaxin as weekly; completed month)
+9. 月線 KDJ 黃柱 — latest month bar (incl. forming)
+10. 月線 SAR 喺價上 — TV ta.sar; latest month bar (incl. forming)
+11. 月線主力能量 — 做空 > 做多 (same Tongdaxin as weekly; incl. forming month)
 
 Universe: Nasdaq Trader US incl. ETF/Fund. Yahoo auto_adjust=True.
-Default: drop forming daily/weekly bars (gates 1–8); gates 9+11 completed month;
-gate 10 includes forming month.
+Default: drop forming *daily* bar before 16:15 ET; weekly/monthly gates use the
+latest bar even if incomplete (matches TradingView current candle).
 """
 from __future__ import annotations
 
@@ -135,6 +135,7 @@ def drop_forming(d: pd.DataFrame) -> pd.DataFrame:
 
 
 def drop_forming_weekly(w: pd.DataFrame) -> pd.DataFrame:
+    """Legacy: drop incomplete W-FRI bar. Weekly gates no longer call this."""
     if w is None or w.empty:
         return w
     now = ny_now()
@@ -146,6 +147,7 @@ def drop_forming_weekly(w: pd.DataFrame) -> pd.DataFrame:
 
 
 def drop_forming_monthly(m: pd.DataFrame) -> pd.DataFrame:
+    """Legacy: drop incomplete month bar. Monthly gates no longer call this."""
     if m is None or m.empty:
         return m
     now = ny_now()
@@ -493,10 +495,8 @@ def eval_gates(d: pd.DataFrame, forming: bool = False) -> dict[str, bool]:
     if len(dd) >= 5 and td_match(pd.DataFrame({"Close": c}), DEFAULT_TD_D):
         hits["05_td_daily"] = True
 
-    # weekly gates 6–8
+    # weekly gates 6–8 — keep forming week (TV current candle)
     w = to_weekly(dd)
-    if not forming:
-        w = drop_forming_weekly(w)
     if w is not None and not w.empty and len(w) >= 5:
         if td_match(w, DEFAULT_TD_W):
             hits["06_td_weekly"] = True
@@ -505,15 +505,13 @@ def eval_gates(d: pd.DataFrame, forming: bool = False) -> dict[str, bool]:
         if kdj_yellow(w):
             hits["08_kdj_weekly"] = True
 
-    # monthly 9+11 (completed) + 10 (forming included)
+    # monthly 9–11 — keep forming month (TV current candle)
     m_all = to_monthly(dd)
-    m_done = drop_forming_monthly(m_all) if not forming else m_all
-    if m_done is not None and not m_done.empty and kdj_yellow(m_done):
+    if m_all is not None and not m_all.empty and kdj_yellow(m_all):
         hits["09_kdj_monthly"] = True
-    m_sar = m_all if (m_all is not None and len(m_all) >= 3) else m_done
-    if m_sar is not None and not m_sar.empty and monthly_sar_above_close(m_sar):
+    if m_all is not None and not m_all.empty and len(m_all) >= 3 and monthly_sar_above_close(m_all):
         hits["10_sar_monthly"] = True
-    if m_done is not None and not m_done.empty and zhuli_bear_gt_bull(m_done):
+    if m_all is not None and not m_all.empty and zhuli_bear_gt_bull(m_all):
         hits["11_zhuli_monthly"] = True
 
     return hits

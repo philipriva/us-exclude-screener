@@ -11,16 +11,16 @@
 | 3 | `exclude_03_ema50` | 日線 close &lt; EMA50 | |
 | 4 | `exclude_04_mcap` | 市值 &lt; 100M | 查唔到 mcap → 跳過，唔當 hit |
 | 5 | `exclude_05_td_daily` | 日線 TD Sequential | 預設只 S2（S＝close&lt;close[4]） |
-| 6 | `exclude_06_td_weekly` | 週線 TD Sequential | 預設 S1+S2（週線由日線合成） |
-| 7 | `exclude_07_zhuli` | 週線主力能量 | 做空線 &gt; 做多線 |
-| 8 | `exclude_08_kdj_weekly` | 週線 KDJ 黃柱 | KDJ(9,3,3) J 由 ≥50 跌穿 50 |
-| 9 | `exclude_09_kdj_monthly` | 月線 KDJ 黃柱 | 同上；**只用已收市月** |
+| 6 | `exclude_06_td_weekly` | 週線 TD Sequential | 預設 S1+S2（週線由日線合成）；**含未收市週** |
+| 7 | `exclude_07_zhuli` | 週線主力能量 | 做空線 &gt; 做多線；**含未收市週** |
+| 8 | `exclude_08_kdj_weekly` | 週線 KDJ 黃柱 | KDJ(9,3,3) J 由 ≥50 跌穿 50；**含未收市週** |
+| 9 | `exclude_09_kdj_monthly` | 月線 KDJ 黃柱 | 同上；**含未收市月**（跟 TV 當前月 K） |
 | 10 | `exclude_10_sar_monthly` | 月線 SAR 喺價上 | TV `ta.sar(0.02,0.02,0.2)`；`close&lt;SAR`；**含未收市月** |
-| 11 | `exclude_11_zhuli_monthly` | 月線主力能量 | 做空線 &gt; 做多線（同閘7）；**只用已收市月** |
+| 11 | `exclude_11_zhuli_monthly` | 月線主力能量 | 做空線 &gt; 做多線（同閘7）；**含未收市月** |
 
 - **宇宙**：Nasdaq Trader 全美（含 ETF／Fund）；剔測試／`$`／`^`
 - **價**：Yahoo `auto_adjust=True`
-- **未收市日／週 K**：閘 1–8 預設丟掉（美東 16:15 前）；閘 9／11 用已收市月；閘 10 含未收市月
+- **未收市 K**：日線閘 1–5 預設丟掉未收市日（美東 16:15 前）；**週／月閘 6–11 一律用最新未收完 bar**（跟 TradingView 當前週／月 K）
 - **未做**：月線綠帶（赚钱轨道）
 
 ## Drive
