@@ -83,6 +83,9 @@
     "unique_symbols": 8484,
     "gate11_hits": 2522,
     "gate11_note": "月線主力能量 completed-month Tongdaxin; Yahoo rate-limit missed some late alphabet tickers in download (~10k of ~12.9k had OHLC)",
-    "duplicate_priority": "月線主力>週線主力>月線SAR>MCDX>月線KDJ>週線KDJ>市值>EMA200>EMA50>週線TD>日線TD"
-  }
+    "duplicate_priority": "月線主力>週線主力>月線SAR>MCDX>月線KDJ>週線KDJ>市值>EMA200>EMA50>週線TD>日線TD",
+    "layout": "combine us_exclude_screener in processing; exclude_01–11 gate sheets in GROK/github. Action writes by spreadsheet file id."
+  },
+  "gates_folder_id": "1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A",
+  "gates_folder_url": "https://drive.google.com/drive/folders/1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A"
 }
