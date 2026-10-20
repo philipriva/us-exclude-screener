@@ -314,12 +314,15 @@ def zhuli_bear_gt_bull(w: pd.DataFrame) -> bool:
     hh36 = h.rolling(36, min_periods=36).max()
     ll36 = l.rolling(36, min_periods=36).min()
     rng36 = hh36 - ll36
-    var1 = ((hh36 - c) / rng36 * 100.0).where(rng36 > 0, 0.0)
+    var1 = (hh36 - c) / rng36 * 100.0
+    # Keep NaN while HHV/LLV not ready; .where(rng>0,0) treats NaN as 0 and poisons SMA_CN
+    var1 = var1.mask(rng36.eq(0) & rng36.notna(), 0.0)
     bear = sma_cn(var1, 3)
     hh9 = h.rolling(9, min_periods=9).max()
     ll9 = l.rolling(9, min_periods=9).min()
     rng9 = hh9 - ll9
-    var2 = ((c - ll9) / rng9 * 100.0).where(rng9 > 0, 0.0)
+    var2 = (c - ll9) / rng9 * 100.0
+    var2 = var2.mask(rng9.eq(0) & rng9.notna(), 0.0)
     bull = sma_cn(var2, 5) - 8.0
     b, u = float(bear.iloc[-1]), float(bull.iloc[-1])
     if pd.isna(b) or pd.isna(u):
