@@ -2,12 +2,14 @@ name: Daily Exclude Screener (11 gates → Sheets)
 
 on:
   schedule:
-    # After US cash close Mon–Fri, when Yahoo daily bars are usually settled.
-    # 06:00 UTC Tue–Sat =
-    #   ET: 02:00 EDT / 01:00 EST (~9–10h after 16:00 ET close; before next 09:30 ET open)
-    #   HKT: 14:00 Tue–Sat
-    # Earlier 01:00 UTC (~21:00/20:00 ET) is also after close but Yahoo is often still catching up.
-    - cron: "0 6 * * 2-6"
+    # GitHub Actions cron is UTC only (no CRON_TZ).
+    # Intent: US cash equity close + 2 hours, Mon–Fri; finish before 09:00 Asia/Hong_Kong.
+    # Same pattern as ExtraScan QQscan:
+    #   0 22 * * 1-5 ≈ 18:00 America/New_York during EDT (UTC-4) = close+2h
+    #   → ~06:00 HKT next calendar morning; job ~24–40min ⇒ well before 09:00 HKT.
+    # During EST (UTC-5) the same UTC cron is 17:00 ET = close+1h (GitHub UTC limitation;
+    # still after close, still before 09:00 HKT). Optional EST shift: 0 23 * * 1-5.
+    - cron: "0 22 * * 1-5"
   workflow_dispatch:
 
 jobs:

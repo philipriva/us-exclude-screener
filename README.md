@@ -34,11 +34,11 @@ IDs 見 `sheet_ids.json`（Actions／本地有 SA 會用 **file id** 覆寫內�
 
 ## GitHub Actions
 
-- **排程**：`cron: 0 6 * * 2-6`（UTC，Tue–Sat）
-  - **對應美股**：Mon–Fri 常規收市（16:00 ET）之後約 **9–10 小時**
-  - **美東**：約 **02:00 EDT**／**01:00 EST**（下一個交易日 09:30 ET 開市前仍有充足時間）
-  - **香港（HKT）**：約 **14:00**（Tue–Sat）
-  - **點解唔用更早（例如 01:00 UTC）**：收市後 4–5 小時 Yahoo 日線／市值有時仍未穩；凌晨段通常較齊，跑完亦一定喺下個開市前
+- **排程**：`cron: 0 22 * * 1-5`（UTC，Mon–Fri；同 ExtraScan QQscan）
+  - **意圖**：美股現金股市收市後 **2 小時** 開跑；喺 **香港時間上午 9 時前** 寫完 Sheet
+  - **EDT（UTC-4）**：約 **18:00 ET**＝收市+2h → 約 **翌日 06:00 HKT** 開跑；job ~24–40 分鐘 ⇒ 遠早於 09:00 HKT
+  - **EST（UTC-5）**：同一 UTC cron 變 **17:00 ET**＝收市+1h（GitHub 只有 UTC cron 嘅限制；仍係收市後、仍早於 09:00 HKT）。可選改 `0 23 * * 1-5`
+  - **Yahoo**：收市後約 1–2 小時日線通常已齊；唔再等凌晨 02:00 ET
 - **手動**：Actions → *Daily Exclude Screener* → Run workflow（`workflow_dispatch`）
 - **Artifact**：`exclude_gates`（`out/` 入面每閘 `.txt`／`.csv` + combine），保留 14 日
 
