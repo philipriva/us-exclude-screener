@@ -35,14 +35,25 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from us_session import (
+    CalendarUnavailableError,
+    last_complete_us_session_date,
+    session_bar_date,
+)
+
 NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
-N, SMA, BATCH = 100, 10, 150
+N, SMA, BATCH = 100, 10, 50
 MCAP_MAX = 100_000_000
-MCAP_WORKERS = 8
+MCAP_WORKERS = 4
 DEFAULT_TD_D = {"S2"}
 DEFAULT_TD_W = {"S1", "S2"}
 PERIOD = "5y"
+# Bounded download recovery (not a permanent poller).
+DOWNLOAD_MAX_ROUNDS = 4
+DOWNLOAD_RETRY_SLEEP_BASE = 2.0
+DOWNLOAD_THREADS = False  # lower Yahoo concurrency; rate-limit was silent under threads=True
+INVALID_TICKERS = {"NAN", "NONE", "NULL", "N/A", ""}
 
 GATE_ORDER = [
     "01_mcdx",
@@ -105,14 +116,15 @@ def universe() -> list[str]:
     if "Test Issue" in df.columns:
         df = df[df["Test Issue"].fillna("N") == "N"]
     df = df[~df.sym.str.contains(r"[\$\^]")]
-    return sorted({s.strip().upper().replace(".", "-") for s in df.sym})
+    syms = {s.strip().upper().replace(".", "-") for s in df.sym}
+    return sorted(s for s in syms if s and s not in INVALID_TICKERS)
 
 
 def parse_syms(text: str) -> list[str]:
     out, seen = [], set()
     for p in text.replace(",", " ").split():
         s = p.strip().upper().replace(".", "-")
-        if s and s not in seen:
+        if s and s not in INVALID_TICKERS and s not in seen:
             seen.add(s)
             out.append(s)
     return out
@@ -412,14 +424,60 @@ def fetch_mcap(sym: str) -> float | None:
     return None
 
 
-def download(syms: list[str]) -> dict[str, pd.DataFrame]:
+def _extract_batch_frames(raw: pd.DataFrame | None, batch: list[str]) -> dict[str, pd.DataFrame]:
+    """Pull per-ticker OHLC frames from a yfinance batch result (no raise → empty)."""
+    got: dict[str, pd.DataFrame] = {}
+    if raw is None or getattr(raw, "empty", True):
+        return got
+    for s in batch:
+        try:
+            d = raw[s] if len(batch) > 1 else raw
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(-1)
+            need = [c for c in ("Open", "High", "Low", "Close") if c in d.columns]
+            if len(need) < 4:
+                continue
+            d = d.dropna(subset=["Close", "High", "Low"])
+            if not d.empty:
+                got[s] = d
+        except Exception:
+            continue
+    return got
+
+
+def download(
+    syms: list[str],
+    *,
+    max_rounds: int = DOWNLOAD_MAX_ROUNDS,
+    batch_size: int = BATCH,
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    """Download daily bars with bounded retries for empty / rate-limited tickers.
+
+    yfinance often *prints* ``YFRateLimitError`` / ``Failed downloads`` and returns a
+    partial frame **without raising**. The old outer ``try/except`` therefore never
+    retried (production run 42146532613: 0 ``retry`` log lines, 3672 rate-limit
+    symbols missing). Empty frames are treated as failures and retried.
+    """
     out: dict[str, pd.DataFrame] = {}
-    n = len(syms)
-    for i in range(0, n, BATCH):
-        bt = syms[i : i + BATCH]
-        print(f"download {min(i + BATCH, n)}/{n}", flush=True)
-        raw = None
-        for a in range(3):
+    errors: dict[str, str] = {}
+    pending = list(syms)
+    for round_i in range(max_rounds):
+        if not pending:
+            break
+        print(
+            f"download_round={round_i + 1}/{max_rounds} pending={len(pending)}",
+            flush=True,
+        )
+        next_pending: list[str] = []
+        n = len(pending)
+        for i in range(0, n, batch_size):
+            bt = pending[i : i + batch_size]
+            print(
+                f"download {min(i + batch_size, n)}/{n} (round {round_i + 1})",
+                flush=True,
+            )
+            raw = None
+            raised: Exception | None = None
             try:
                 raw = yf.download(
                     bt,
@@ -427,31 +485,100 @@ def download(syms: list[str]) -> dict[str, pd.DataFrame]:
                     interval="1d",
                     group_by="ticker",
                     auto_adjust=True,
-                    threads=True,
+                    threads=DOWNLOAD_THREADS,
                     progress=False,
                 )
-                break
             except Exception as e:
-                print("retry", a, e, flush=True)
-                time.sleep(1.5 * (a + 1))
-        if raw is None or raw.empty:
-            continue
-        for s in bt:
+                raised = e
+                print(f"retryable_exception round={round_i + 1} err={e}", flush=True)
+                raw = None
+            got = _extract_batch_frames(raw, bt)
+            for s in bt:
+                if s in got:
+                    out[s] = got[s]
+                    errors.pop(s, None)
+                else:
+                    reason = (
+                        f"exception:{type(raised).__name__}:{raised}"
+                        if raised is not None
+                        else "empty_or_rate_limited_no_ohlc"
+                    )
+                    errors[s] = reason
+                    next_pending.append(s)
+            time.sleep(0.25)
+        pending = next_pending
+        if pending and round_i < max_rounds - 1:
+            sleep_s = DOWNLOAD_RETRY_SLEEP_BASE * (2 ** round_i)
+            print(
+                f"download_retry_sleep={sleep_s:.1f}s remaining={len(pending)}",
+                flush=True,
+            )
+            time.sleep(sleep_s)
+    if pending:
+        print(f"download_still_missing={len(pending)} after {max_rounds} rounds", flush=True)
+    return out, errors
+
+
+def classify_ticker_bars(
+    data: dict[str, pd.DataFrame],
+    errors: dict[str, str],
+    universe: list[str],
+    target_session,
+) -> dict:
+    """Per-ticker outcome for audit. Does not invent a coverage PASS threshold."""
+    target = target_session.isoformat() if hasattr(target_session, "isoformat") else str(target_session)
+    per: dict[str, dict] = {}
+    counts = {
+        "universe": len(universe),
+        "ok_target_session": 0,
+        "stale": 0,
+        "future": 0,
+        "short_history": 0,
+        "missing": 0,
+        "error": 0,
+        "no_bar_date": 0,
+    }
+    for s in universe:
+        if s in data:
+            d = data[s]
             try:
-                d = raw[s] if len(bt) > 1 else raw
-                if isinstance(d.columns, pd.MultiIndex):
-                    d.columns = d.columns.get_level_values(-1)
-                # auto_adjust may drop Adj Close; need OHLC
-                need = [c for c in ("Open", "High", "Low", "Close") if c in d.columns]
-                if len(need) < 4:
-                    continue
-                d = d.dropna(subset=["Close", "High", "Low"])
-                if not d.empty:
-                    out[s] = d
+                last = session_bar_date(d.index[-1])
+                last_s = last.isoformat()
             except Exception:
-                pass
-        time.sleep(0.15)
-    return out
+                per[s] = {"status": "no_bar_date", "bars": int(len(d))}
+                counts["no_bar_date"] += 1
+                continue
+            eligible = bool(len(d) >= 5)
+            if not eligible:
+                status = "short_history"
+                counts["short_history"] += 1
+            elif last_s == target:
+                status = "ok_target_session"
+                counts["ok_target_session"] += 1
+            elif last_s < target:
+                status = "stale"
+                counts["stale"] += 1
+            else:
+                status = "future"
+                counts["future"] += 1
+            per[s] = {
+                "status": status,
+                "last_bar_date": last_s,
+                "bars": int(len(d)),
+                "signal_eligible_min_bars": eligible,
+            }
+        else:
+            reason = errors.get(s, "missing")
+            status = "error" if reason.startswith("exception:") else "missing"
+            counts[status] += 1
+            per[s] = {"status": status, "error": reason, "last_bar_date": None}
+    return {
+        "target_session": target,
+        "counts": counts,
+        "per_ticker": per,
+        "source_input_count": len(universe),
+        "downloaded_count": len(data),
+    }
 
 
 def eval_gates(d: pd.DataFrame, forming: bool = False) -> dict[str, bool]:
@@ -597,8 +724,18 @@ def main() -> int:
             print("unknown gates:", unknown, flush=True)
             return 2
 
-    data = download(syms)
-    print(f"data={len(data)}", flush=True)
+    try:
+        target_session = last_complete_us_session_date()
+    except CalendarUnavailableError as e:
+        print(f"FAIL_CLOSED calendar: {e}", flush=True)
+        return 3
+    print(f"target_session={target_session.isoformat()}", flush=True)
+
+    data, dl_errors = download(syms)
+    print(f"data={len(data)} missing={len(dl_errors)}", flush=True)
+    outcome = classify_ticker_bars(data, dl_errors, syms, target_session)
+    # Compact summary without dumping every ticker into stdout
+    print(f"bar_counts={json.dumps(outcome['counts'])}", flush=True)
 
     gate_hits: dict[str, list[str]] = {k: [] for k in GATE_ORDER}
     for i, (s, d) in enumerate(data.items()):
@@ -635,11 +772,106 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     write_local(gate_hits, out_dir, asof)
 
+    # Rich outcome for downstream verification (Sheet Ops / parent). No .90 gate.
+    sheet_target_plan = {
+        "policy": "owner_readme_sheet_ids",
+        "combine_and_duplicate": {
+            "spreadsheet_id": None,
+            "tabs": ["combine", "Duplicate"],
+        },
+        "gates": {
+            "mode": "separate_spreadsheets_per_gate",
+            "note": (
+                "Do NOT silently rewrite exclude_* tabs on the combine workbook "
+                "unless Philip explicitly authorizes that contract change."
+            ),
+        },
+        "pending_decision": (
+            "optional_also_write_gate_tabs_on_combine_workbook — NOT enabled in this PR"
+        ),
+    }
+    try:
+        cfg = json.loads(Path(args.sheet_ids).read_text(encoding="utf-8"))
+        sheet_target_plan["combine_and_duplicate"]["spreadsheet_id"] = (cfg.get("combine") or {}).get("id")
+        sheet_target_plan["gates"]["ids"] = {
+            k: (cfg.get("gates") or {}).get(k, {}).get("id") for k in GATE_ORDER
+        }
+    except Exception as e:
+        sheet_target_plan["config_error"] = str(e)
+
+    missing_n = int(outcome["counts"]["missing"]) + int(outcome["counts"]["error"])
+    download_complete = missing_n == 0
+    ready_for_sheets = bool(download_complete and outcome["counts"]["ok_target_session"] > 0)
+    # Owner has no approved coverage fraction for us-exclude. Incomplete download must
+    # not look like a full successful Sheet refresh.
+    run_outcome = {
+        "asof_et_wallclock": asof,
+        "target_session": target_session.isoformat(),
+        "download_complete": download_complete,
+        "ready_for_sheets": ready_for_sheets,
+        "counts": outcome["counts"],
+        "downloaded_count": outcome["downloaded_count"],
+        "source_input_count": outcome["source_input_count"],
+        "source_input_hash": __import__("hashlib").sha256(
+            ("\n".join(syms)).encode()
+        ).hexdigest(),
+        "policy": {
+            "batch": BATCH,
+            "download_max_rounds": DOWNLOAD_MAX_ROUNDS,
+            "download_threads": DOWNLOAD_THREADS,
+            "coverage_threshold": None,
+            "coverage_threshold_note": (
+                "No owner-approved freshness/coverage fraction for us-exclude; "
+                "ExtraScan 0.90 must not be applied here."
+            ),
+        },
+        "sheet_target_plan": sheet_target_plan,
+        "gate_hit_counts": {k: len(set(gate_hits.get(k, []))) for k in GATE_ORDER},
+        "errors_sample": dict(list(dl_errors.items())[:50]),
+        "errors_total": len(dl_errors),
+    }
+    # Keep per-ticker detail in a sidecar (can be large).
+    (out_dir / "run_outcome.json").write_text(
+        json.dumps(run_outcome, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "ticker_outcomes.json").write_text(
+        json.dumps(outcome["per_ticker"], ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    meta_txt = out_dir / "run_meta.txt"
+    meta_txt.write_text(
+        meta_txt.read_text(encoding="utf-8")
+        + f"target_session={target_session.isoformat()}\n"
+        + f"downloaded={len(data)}\n"
+        + f"missing={missing_n}\n"
+        + f"ok_target_session={outcome['counts']['ok_target_session']}\n"
+        + f"stale={outcome['counts']['stale']}\n"
+        + f"download_complete={download_complete}\n"
+        + f"ready_for_sheets={ready_for_sheets}\n",
+        encoding="utf-8",
+    )
+
     if not args.skip_sheets:
-        maybe_write_sheets(gate_hits, Path(args.sheet_ids))
+        if not ready_for_sheets:
+            print(
+                "Sheets: BLOCKED — download incomplete or no target-session bars; "
+                "refusing silent partial Sheet write",
+                flush=True,
+            )
+        else:
+            maybe_write_sheets(gate_hits, Path(args.sheet_ids))
 
     for k in GATE_ORDER:
         print(f"COUNT {k}={len(set(gate_hits[k]))} ({GATE_LABELS[k]})", flush=True)
+
+    if not download_complete:
+        print(
+            f"EXIT_INCOMPLETE missing_or_error={missing_n} "
+            f"(local artifacts written; Sheets blocked)",
+            flush=True,
+        )
+        return 1
     return 0
 
 
