@@ -53,7 +53,7 @@ PERIOD = "5y"
 DOWNLOAD_MAX_ROUNDS = 4
 DOWNLOAD_RETRY_SLEEP_BASE = 2.0
 DOWNLOAD_THREADS = False  # lower Yahoo concurrency; rate-limit was silent under threads=True
-INVALID_TICKERS = {"NAN", "NONE", "NULL", "N/A", ""}
+# Do NOT blacklist real Nasdaq symbols such as "NA" (Nano Labs). Only blank tokens.
 
 GATE_ORDER = [
     "01_mcdx",
@@ -99,32 +99,84 @@ DUP_GATE_PRIORITY = [
 ]
 
 
+class UniverseParseError(RuntimeError):
+    """FAIL_CLOSED: Nasdaq Trader directory HTTP/schema/footer failure."""
+
+
 def _dir(url: str) -> pd.DataFrame:
-    t = requests.get(url, timeout=60).text
-    t = "\n".join(l for l in t.splitlines() if l and not l.startswith("File Creation"))
-    return pd.read_csv(io.StringIO(t), sep="|", dtype=str)
+    """Fetch a Nasdaq Trader symbol directory. Fail-closed on HTTP/schema/footer issues.
+
+    Uses keep_default_na=False so real ticker ``NA`` (Nano Labs) is not swallowed by
+    pandas' default NA token list.
+    """
+    try:
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+    except Exception as e:
+        raise UniverseParseError(f"FAIL_CLOSED: HTTP fetch failed for {url}: {e}") from e
+    lines = resp.text.splitlines()
+    footer = [l for l in lines if l.startswith("File Creation")]
+    if not footer:
+        raise UniverseParseError(
+            f"FAIL_CLOSED: missing 'File Creation' footer from {url}"
+        )
+    body = [l for l in lines if l and not l.startswith("File Creation")]
+    if len(body) < 2:
+        raise UniverseParseError(
+            f"FAIL_CLOSED: directory body too short from {url} (rows={len(body)})"
+        )
+    try:
+        df = pd.read_csv(
+            io.StringIO("\n".join(body)),
+            sep="|",
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False,
+        )
+    except Exception as e:
+        raise UniverseParseError(f"FAIL_CLOSED: CSV parse failed for {url}: {e}") from e
+    if df.empty or len(df.columns) < 1:
+        raise UniverseParseError(f"FAIL_CLOSED: empty/invalid schema from {url}")
+    return df
 
 
 def universe() -> list[str]:
-    a = _dir(NASDAQ_LISTED).rename(columns={"Symbol": "sym"})
-    b = _dir(OTHER_LISTED).rename(columns={"ACT Symbol": "sym"})
+    a = _dir(NASDAQ_LISTED)
+    b = _dir(OTHER_LISTED)
+    if "Symbol" not in a.columns:
+        raise UniverseParseError(
+            "FAIL_CLOSED: nasdaqlisted.txt missing Symbol column; "
+            f"cols={list(a.columns)}"
+        )
+    if "ACT Symbol" not in b.columns:
+        raise UniverseParseError(
+            "FAIL_CLOSED: otherlisted.txt missing ACT Symbol column; "
+            f"cols={list(b.columns)}"
+        )
+    a = a.rename(columns={"Symbol": "sym"})
+    b = b.rename(columns={"ACT Symbol": "sym"})
     pieces = []
     for df in (a, b):
         use = [c for c in ("sym", "Test Issue") if c in df.columns]
         pieces.append(df[use])
-    df = pd.concat(pieces).dropna(subset=["sym"])
+    df = pd.concat(pieces, ignore_index=True)
+    # Empty string only — do not drop real tickers that look like NA/NONE/NULL tokens.
+    df["sym"] = df["sym"].astype(str).str.strip()
+    df = df[df["sym"] != ""]
     if "Test Issue" in df.columns:
-        df = df[df["Test Issue"].fillna("N") == "N"]
-    df = df[~df.sym.str.contains(r"[\$\^]")]
-    syms = {s.strip().upper().replace(".", "-") for s in df.sym}
-    return sorted(s for s in syms if s and s not in INVALID_TICKERS)
+        ti = df["Test Issue"].astype(str).str.strip().str.upper()
+        df = df[ti.isin(("", "N"))]
+    df = df[~df.sym.str.contains(r"[\$\^]", regex=True, na=False)]
+    syms = {s.upper().replace(".", "-") for s in df.sym}
+    # Blank only. Preserve NA / NONE / NULL if they ever appear as real symbols.
+    return sorted(s for s in syms if s)
 
 
 def parse_syms(text: str) -> list[str]:
     out, seen = [], set()
     for p in text.replace(",", " ").split():
         s = p.strip().upper().replace(".", "-")
-        if s and s not in INVALID_TICKERS and s not in seen:
+        if s and s not in seen:
             seen.add(s)
             out.append(s)
     return out
@@ -424,25 +476,103 @@ def fetch_mcap(sym: str) -> float | None:
     return None
 
 
+def _frame_has_ohlc(d: pd.DataFrame) -> bool:
+    need = [c for c in ("Open", "High", "Low", "Close") if c in getattr(d, "columns", [])]
+    return len(need) == 4
+
+
+def _normalize_ohlc_frame(d: pd.DataFrame) -> pd.DataFrame | None:
+    """Return OHLC frame with non-all-NaN rows, or None if unusable."""
+    if d is None or getattr(d, "empty", True):
+        return None
+    if isinstance(d.columns, pd.MultiIndex):
+        # Prefer field names on the last level; fall back to first if needed.
+        lvl_last = [str(x) for x in d.columns.get_level_values(-1)]
+        lvl_first = [str(x) for x in d.columns.get_level_values(0)]
+        if set(("Open", "High", "Low", "Close")).issubset(set(lvl_last)):
+            d = d.copy()
+            d.columns = d.columns.get_level_values(-1)
+        elif set(("Open", "High", "Low", "Close")).issubset(set(lvl_first)):
+            d = d.copy()
+            d.columns = d.columns.get_level_values(0)
+        else:
+            return None
+    if not _frame_has_ohlc(d):
+        return None
+    # Drop rows where OHLC are all NaN; require Close/High/Low present for signals.
+    d = d.dropna(subset=["Open", "High", "Low", "Close"], how="all")
+    d = d.dropna(subset=["Close", "High", "Low"])
+    if d.empty:
+        return None
+    # Reject frames whose entire OHLC columns are still NaN after dropna edge cases.
+    if d[["Open", "High", "Low", "Close"]].isna().all().all():
+        return None
+    return d
+
+
 def _extract_batch_frames(raw: pd.DataFrame | None, batch: list[str]) -> dict[str, pd.DataFrame]:
-    """Pull per-ticker OHLC frames from a yfinance batch result (no raise → empty)."""
+    """Pull per-ticker OHLC frames from a yfinance batch result (no raise → empty).
+
+    Handles both MultiIndex level orders: (ticker, field) and (field, ticker),
+    plus single-ticker flat columns.
+    """
     got: dict[str, pd.DataFrame] = {}
     if raw is None or getattr(raw, "empty", True):
         return got
+    multi = isinstance(raw.columns, pd.MultiIndex)
     for s in batch:
         try:
-            d = raw[s] if len(batch) > 1 else raw
-            if isinstance(d.columns, pd.MultiIndex):
-                d.columns = d.columns.get_level_values(-1)
-            need = [c for c in ("Open", "High", "Low", "Close") if c in d.columns]
-            if len(need) < 4:
-                continue
-            d = d.dropna(subset=["Close", "High", "Low"])
-            if not d.empty:
-                got[s] = d
+            d = None
+            if multi:
+                levels0 = set(map(str, raw.columns.get_level_values(0)))
+                levels1 = set(map(str, raw.columns.get_level_values(-1)))
+                if s in levels0 and set(("Open", "High", "Low", "Close")).issubset(levels1):
+                    # (ticker, field)
+                    d = raw[s]
+                elif s in levels1 and set(("Open", "High", "Low", "Close")).issubset(levels0):
+                    # (field, ticker)
+                    d = raw.xs(s, axis=1, level=-1)
+                elif s in levels0:
+                    d = raw[s]
+                elif s in levels1:
+                    d = raw.xs(s, axis=1, level=-1)
+            else:
+                d = raw if len(batch) == 1 else None
+                if d is None and s in raw.columns:
+                    # unexpected flat layout — skip
+                    d = None
+            norm = _normalize_ohlc_frame(d if d is not None else raw if len(batch) == 1 and not multi else None)
+            if norm is not None:
+                got[s] = norm
         except Exception:
             continue
     return got
+
+
+def _classify_download_failure(
+    *,
+    raised: Exception | None,
+    stderr_text: str,
+) -> str:
+    """Honest failure class — do not label every empty as permanent delist or rate-limit."""
+    blob = stderr_text or ""
+    if raised is not None:
+        blob = f"{blob}\n{type(raised).__name__}: {raised}"
+    low = blob.lower()
+    if (
+        "yfratelimiterror" in low
+        or "too many requests" in low
+        or "rate limited" in low
+        or "rate limit" in low
+        or "http 429" in low
+        or "429" in low and "rate" in low
+    ):
+        return "rate_limit_confirmed"
+    if raised is not None:
+        return f"exception:{type(raised).__name__}"
+    if blob.strip():
+        return "unavailable_or_unknown_with_stderr"
+    return "unavailable_or_unknown_empty"
 
 
 def download(
@@ -451,13 +581,15 @@ def download(
     max_rounds: int = DOWNLOAD_MAX_ROUNDS,
     batch_size: int = BATCH,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
-    """Download daily bars with bounded retries for empty / rate-limited tickers.
+    """Download daily bars with bounded serial retries for empty / rate-limited tickers.
 
     yfinance often *prints* ``YFRateLimitError`` / ``Failed downloads`` and returns a
-    partial frame **without raising**. The old outer ``try/except`` therefore never
-    retried (production run 42146532613: 0 ``retry`` log lines, 3672 rate-limit
-    symbols missing). Empty frames are treated as failures and retried.
+    partial frame **without raising**. Empty / missing tickers are retried up to
+    ``max_rounds``; failure reasons are classified honestly (confirmed rate-limit vs
+    unavailable/UNKNOWN). Not a permanent poller.
     """
+    import contextlib
+
     out: dict[str, pd.DataFrame] = {}
     errors: dict[str, str] = {}
     pending = list(syms)
@@ -478,30 +610,31 @@ def download(
             )
             raw = None
             raised: Exception | None = None
+            err_buf = io.StringIO()
             try:
-                raw = yf.download(
-                    bt,
-                    period=PERIOD,
-                    interval="1d",
-                    group_by="ticker",
-                    auto_adjust=True,
-                    threads=DOWNLOAD_THREADS,
-                    progress=False,
-                )
+                with contextlib.redirect_stderr(err_buf):
+                    raw = yf.download(
+                        bt,
+                        period=PERIOD,
+                        interval="1d",
+                        group_by="ticker",
+                        auto_adjust=True,
+                        threads=DOWNLOAD_THREADS,
+                        progress=False,
+                    )
             except Exception as e:
                 raised = e
                 print(f"retryable_exception round={round_i + 1} err={e}", flush=True)
                 raw = None
+            stderr_text = err_buf.getvalue()
             got = _extract_batch_frames(raw, bt)
             for s in bt:
                 if s in got:
                     out[s] = got[s]
                     errors.pop(s, None)
                 else:
-                    reason = (
-                        f"exception:{type(raised).__name__}:{raised}"
-                        if raised is not None
-                        else "empty_or_rate_limited_no_ohlc"
+                    reason = _classify_download_failure(
+                        raised=raised, stderr_text=stderr_text
                     )
                     errors[s] = reason
                     next_pending.append(s)
@@ -515,7 +648,14 @@ def download(
             )
             time.sleep(sleep_s)
     if pending:
-        print(f"download_still_missing={len(pending)} after {max_rounds} rounds", flush=True)
+        # Summarize final classes honestly
+        from collections import Counter
+        c = Counter(errors[s] for s in pending if s in errors)
+        print(
+            f"download_still_missing={len(pending)} after {max_rounds} rounds "
+            f"classes={dict(c)}",
+            flush=True,
+        )
     return out, errors
 
 
@@ -524,8 +664,14 @@ def classify_ticker_bars(
     errors: dict[str, str],
     universe: list[str],
     target_session,
+    *,
+    forming: bool = False,
 ) -> dict:
-    """Per-ticker outcome for audit. Does not invent a coverage PASS threshold."""
+    """Per-ticker outcome. Freshness and history eligibility are reported separately.
+
+    Short history still records last_bar_date so staleness is never masked.
+    Does not invent a coverage PASS threshold.
+    """
     target = target_session.isoformat() if hasattr(target_session, "isoformat") else str(target_session)
     per: dict[str, dict] = {}
     counts = {
@@ -533,45 +679,84 @@ def classify_ticker_bars(
         "ok_target_session": 0,
         "stale": 0,
         "future": 0,
-        "short_history": 0,
         "missing": 0,
         "error": 0,
         "no_bar_date": 0,
+        "history_eligible": 0,
+        "history_short": 0,
+        "rate_limit_confirmed": 0,
+        "unavailable_or_unknown": 0,
     }
     for s in universe:
         if s in data:
-            d = data[s]
+            d_raw = data[s]
+            d_sig = d_raw if forming else drop_forming(d_raw)
+            if d_sig is None or d_sig.empty:
+                per[s] = {
+                    "freshness": "no_bar_date",
+                    "history_eligible": False,
+                    "last_bar_date": None,
+                    "bars": int(len(d_raw)),
+                    "bars_signal": 0,
+                    "note": "empty_after_drop_forming",
+                }
+                counts["no_bar_date"] += 1
+                counts["history_short"] += 1
+                continue
             try:
-                last = session_bar_date(d.index[-1])
+                last = session_bar_date(d_sig.index[-1])
                 last_s = last.isoformat()
             except Exception:
-                per[s] = {"status": "no_bar_date", "bars": int(len(d))}
+                per[s] = {
+                    "freshness": "no_bar_date",
+                    "history_eligible": False,
+                    "last_bar_date": None,
+                    "bars": int(len(d_raw)),
+                    "bars_signal": int(len(d_sig)),
+                }
                 counts["no_bar_date"] += 1
+                counts["history_short"] += 1
                 continue
-            eligible = bool(len(d) >= 5)
-            if not eligible:
-                status = "short_history"
-                counts["short_history"] += 1
-            elif last_s == target:
-                status = "ok_target_session"
+            if last_s == target:
+                freshness = "ok_target_session"
                 counts["ok_target_session"] += 1
             elif last_s < target:
-                status = "stale"
+                freshness = "stale"
                 counts["stale"] += 1
             else:
-                status = "future"
+                freshness = "future"
                 counts["future"] += 1
+            hist_ok = bool(len(d_sig) >= 5)
+            if hist_ok:
+                counts["history_eligible"] += 1
+            else:
+                counts["history_short"] += 1
             per[s] = {
-                "status": status,
+                "freshness": freshness,
+                "history_eligible": hist_ok,
                 "last_bar_date": last_s,
-                "bars": int(len(d)),
-                "signal_eligible_min_bars": eligible,
+                "bars": int(len(d_raw)),
+                "bars_signal": int(len(d_sig)),
             }
         else:
-            reason = errors.get(s, "missing")
-            status = "error" if reason.startswith("exception:") else "missing"
-            counts[status] += 1
-            per[s] = {"status": status, "error": reason, "last_bar_date": None}
+            reason = errors.get(s, "unavailable_or_unknown_empty")
+            if reason == "rate_limit_confirmed":
+                counts["rate_limit_confirmed"] += 1
+                freshness = "missing"
+                counts["missing"] += 1
+            elif str(reason).startswith("exception:"):
+                freshness = "error"
+                counts["error"] += 1
+            else:
+                counts["unavailable_or_unknown"] += 1
+                freshness = "missing"
+                counts["missing"] += 1
+            per[s] = {
+                "freshness": freshness,
+                "history_eligible": False,
+                "last_bar_date": None,
+                "error": reason,
+            }
     return {
         "target_session": target,
         "counts": counts,
@@ -579,6 +764,54 @@ def classify_ticker_bars(
         "source_input_count": len(universe),
         "downloaded_count": len(data),
     }
+
+
+def selected_symbols(gate_hits: dict[str, list[str]]) -> list[str]:
+    out, seen = [], set()
+    for syms in gate_hits.values():
+        for s in syms:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
+
+
+def validate_selected_tickers(
+    gate_hits: dict[str, list[str]],
+    per_ticker: dict,
+    target_session: str,
+) -> list[dict]:
+    """Every written/selected ticker must have real target_session OHLC + min history.
+
+    No policy accepts selected stale/future/unknown. Returns list of violations.
+    """
+    bad: list[dict] = []
+    for s in selected_symbols(gate_hits):
+        info = per_ticker.get(s) or {}
+        freshness = info.get("freshness")
+        last = info.get("last_bar_date")
+        hist = bool(info.get("history_eligible"))
+        if freshness != "ok_target_session" or last != target_session:
+            bad.append(
+                {
+                    "symbol": s,
+                    "reason": "selected_not_target_session",
+                    "freshness": freshness,
+                    "last_bar_date": last,
+                    "expected": target_session,
+                }
+            )
+        elif not hist:
+            bad.append(
+                {
+                    "symbol": s,
+                    "reason": "selected_short_history",
+                    "freshness": freshness,
+                    "last_bar_date": last,
+                    "bars_signal": info.get("bars_signal"),
+                }
+            )
+    return bad
 
 
 def eval_gates(d: pd.DataFrame, forming: bool = False) -> dict[str, bool]:
@@ -713,7 +946,11 @@ def main() -> int:
         syms = parse_syms(args.symbols)
     else:
         print("universe...", flush=True)
-        syms = universe()
+        try:
+            syms = universe()
+        except UniverseParseError as e:
+            print(str(e), flush=True)
+            return 3
     print(f"universe={len(syms)}", flush=True)
 
     want = set(GATE_ORDER)
@@ -731,31 +968,43 @@ def main() -> int:
         return 3
     print(f"target_session={target_session.isoformat()}", flush=True)
 
-    data, dl_errors = download(syms)
+    try:
+        data, dl_errors = download(syms)
+    except Exception as e:
+        print(f"FAIL_CLOSED download: {e}", flush=True)
+        return 4
     print(f"data={len(data)} missing={len(dl_errors)}", flush=True)
-    outcome = classify_ticker_bars(data, dl_errors, syms, target_session)
-    # Compact summary without dumping every ticker into stdout
+    outcome = classify_ticker_bars(
+        data, dl_errors, syms, target_session, forming=args.forming
+    )
     print(f"bar_counts={json.dumps(outcome['counts'])}", flush=True)
+    target_iso = target_session.isoformat()
 
+    # Only evaluate gates on target-session-fresh series (reject stale/future/unknown).
     gate_hits: dict[str, list[str]] = {k: [] for k in GATE_ORDER}
-    for i, (s, d) in enumerate(data.items()):
-        hits = eval_gates(d, forming=args.forming)
+    scan_syms = [
+        s for s, info in outcome["per_ticker"].items()
+        if info.get("freshness") == "ok_target_session" and s in data
+    ]
+    print(f"scan_eligible_target_session={len(scan_syms)}", flush=True)
+    for i, s in enumerate(scan_syms):
+        hits = eval_gates(data[s], forming=args.forming)
         for k, v in hits.items():
             if v and k in want:
                 gate_hits[k].append(s)
         if i % 500 == 0:
-            print(f"scan {i}/{len(data)}", flush=True)
+            print(f"scan {i}/{len(scan_syms)}", flush=True)
 
     if "04_mcap" in want:
-        print(f"mcap check {len(data)}...", flush=True)
+        print(f"mcap check {len(scan_syms)}...", flush=True)
         with ThreadPoolExecutor(max_workers=MCAP_WORKERS) as ex:
-            futs = {ex.submit(fetch_mcap, s): s for s in data}
+            futs = {ex.submit(fetch_mcap, s): s for s in scan_syms}
             done = 0
             for fut in as_completed(futs):
                 s = futs[fut]
                 done += 1
                 if done % 200 == 0:
-                    print(f"mcap {done}/{len(data)}", flush=True)
+                    print(f"mcap {done}/{len(scan_syms)}", flush=True)
                 try:
                     cap = fut.result()
                 except Exception:
@@ -763,16 +1012,24 @@ def main() -> int:
                 if cap is not None and cap < MCAP_MAX:
                     gate_hits["04_mcap"].append(s)
 
-    # Drop gates not requested
     for k in list(gate_hits):
         if k not in want:
             gate_hits[k] = []
+
+    selected_bad = validate_selected_tickers(
+        gate_hits, outcome["per_ticker"], target_iso
+    )
+    if selected_bad:
+        print(
+            f"FAIL_CLOSED selected_date_guard violations={len(selected_bad)} "
+            f"sample={selected_bad[:5]}",
+            flush=True,
+        )
 
     asof = ny_now().strftime("%Y-%m-%d %H:%M ET")
     out_dir = Path(args.out_dir)
     write_local(gate_hits, out_dir, asof)
 
-    # Rich outcome for downstream verification (Sheet Ops / parent). No .90 gate.
     sheet_target_plan = {
         "policy": "owner_readme_sheet_ids",
         "combine_and_duplicate": {
@@ -782,17 +1039,17 @@ def main() -> int:
         "gates": {
             "mode": "separate_spreadsheets_per_gate",
             "note": (
-                "Do NOT silently rewrite exclude_* tabs on the combine workbook "
-                "unless Philip explicitly authorizes that contract change."
+                "Owner contract: 11 independent gate spreadsheets in GROK/github; "
+                "combine+Duplicate only on main us_exclude_screener. "
+                "Do not also write exclude_* tabs onto the combine workbook."
             ),
         },
-        "pending_decision": (
-            "optional_also_write_gate_tabs_on_combine_workbook — NOT enabled in this PR"
-        ),
     }
     try:
         cfg = json.loads(Path(args.sheet_ids).read_text(encoding="utf-8"))
-        sheet_target_plan["combine_and_duplicate"]["spreadsheet_id"] = (cfg.get("combine") or {}).get("id")
+        sheet_target_plan["combine_and_duplicate"]["spreadsheet_id"] = (
+            (cfg.get("combine") or {}).get("id")
+        )
         sheet_target_plan["gates"]["ids"] = {
             k: (cfg.get("gates") or {}).get(k, {}).get("id") for k in GATE_ORDER
         }
@@ -801,20 +1058,39 @@ def main() -> int:
 
     missing_n = int(outcome["counts"]["missing"]) + int(outcome["counts"]["error"])
     download_complete = missing_n == 0
-    ready_for_sheets = bool(download_complete and outcome["counts"]["ok_target_session"] > 0)
-    # Owner has no approved coverage fraction for us-exclude. Incomplete download must
-    # not look like a full successful Sheet refresh.
+    ok_target_n = int(outcome["counts"]["ok_target_session"])
+    # No owner-approved universe coverage fraction. Do NOT invent ExtraScan 0.90
+    # or a homemade 100%-fresh business PASS. FAIL_CLOSED rules:
+    #  - incomplete download after bounded retries → hold
+    #  - zero usable target-session bars → hold
+    #  - any selected ticker not target-session / short history → hold
+    block_reasons: list[str] = []
+    if not download_complete:
+        block_reasons.append(
+            f"download_incomplete missing_or_error={missing_n} "
+            f"(rate_limit_confirmed={outcome['counts']['rate_limit_confirmed']}, "
+            f"unavailable_or_unknown={outcome['counts']['unavailable_or_unknown']})"
+        )
+    if ok_target_n <= 0:
+        block_reasons.append("no_ok_target_session_bars")
+    if selected_bad:
+        block_reasons.append(f"selected_not_all_target_session n={len(selected_bad)}")
+
+    ready_for_sheets = len(block_reasons) == 0
     run_outcome = {
         "asof_et_wallclock": asof,
-        "target_session": target_session.isoformat(),
+        "target_session": target_iso,
         "download_complete": download_complete,
         "ready_for_sheets": ready_for_sheets,
+        "block_reasons": block_reasons,
         "counts": outcome["counts"],
         "downloaded_count": outcome["downloaded_count"],
         "source_input_count": outcome["source_input_count"],
         "source_input_hash": __import__("hashlib").sha256(
             ("\n".join(syms)).encode()
         ).hexdigest(),
+        "selected_count": len(selected_symbols(gate_hits)),
+        "selected_violations": selected_bad[:50],
         "policy": {
             "batch": BATCH,
             "download_max_rounds": DOWNLOAD_MAX_ROUNDS,
@@ -822,15 +1098,25 @@ def main() -> int:
             "coverage_threshold": None,
             "coverage_threshold_note": (
                 "No owner-approved freshness/coverage fraction for us-exclude; "
-                "ExtraScan 0.90 must not be applied here."
+                "ExtraScan 0.90 must not be applied here. "
+                "FAIL_CLOSED: incomplete download, zero target-session bars, or "
+                "any selected stale/future/unknown/short-history blocks Sheets."
+            ),
+            "selected_date_guard": (
+                "every selected ticker must have freshness=ok_target_session, "
+                "last_bar_date==target_session, history_eligible=True"
             ),
         },
         "sheet_target_plan": sheet_target_plan,
         "gate_hit_counts": {k: len(set(gate_hits.get(k, []))) for k in GATE_ORDER},
         "errors_sample": dict(list(dl_errors.items())[:50]),
         "errors_total": len(dl_errors),
+        "error_class_counts": {
+            "rate_limit_confirmed": outcome["counts"]["rate_limit_confirmed"],
+            "unavailable_or_unknown": outcome["counts"]["unavailable_or_unknown"],
+            "error": outcome["counts"]["error"],
+        },
     }
-    # Keep per-ticker detail in a sidecar (can be large).
     (out_dir / "run_outcome.json").write_text(
         json.dumps(run_outcome, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -842,21 +1128,21 @@ def main() -> int:
     meta_txt = out_dir / "run_meta.txt"
     meta_txt.write_text(
         meta_txt.read_text(encoding="utf-8")
-        + f"target_session={target_session.isoformat()}\n"
+        + f"target_session={target_iso}\n"
         + f"downloaded={len(data)}\n"
         + f"missing={missing_n}\n"
-        + f"ok_target_session={outcome['counts']['ok_target_session']}\n"
+        + f"ok_target_session={ok_target_n}\n"
         + f"stale={outcome['counts']['stale']}\n"
         + f"download_complete={download_complete}\n"
-        + f"ready_for_sheets={ready_for_sheets}\n",
+        + f"ready_for_sheets={ready_for_sheets}\n"
+        + f"block_reasons={';'.join(block_reasons) if block_reasons else 'none'}\n",
         encoding="utf-8",
     )
 
     if not args.skip_sheets:
         if not ready_for_sheets:
             print(
-                "Sheets: BLOCKED — download incomplete or no target-session bars; "
-                "refusing silent partial Sheet write",
+                "Sheets: BLOCKED — " + "; ".join(block_reasons),
                 flush=True,
             )
         else:
@@ -865,15 +1151,14 @@ def main() -> int:
     for k in GATE_ORDER:
         print(f"COUNT {k}={len(set(gate_hits[k]))} ({GATE_LABELS[k]})", flush=True)
 
-    if not download_complete:
+    if block_reasons:
         print(
-            f"EXIT_INCOMPLETE missing_or_error={missing_n} "
-            f"(local artifacts written; Sheets blocked)",
+            "EXIT_FAIL_CLOSED " + "; ".join(block_reasons)
+            + " (local artifacts written; Sheets blocked; workflow must not look green)",
             flush=True,
         )
         return 1
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

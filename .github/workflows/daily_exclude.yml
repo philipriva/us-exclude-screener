@@ -27,10 +27,12 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python run_exclude.py --out-dir out
-      - name: Upload gate artifacts
+      - name: Upload gate artifacts (always — keep fail-closed evidence)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: exclude_gates
           path: |
             out/
           retention-days: 14
+          if-no-files-found: warn
