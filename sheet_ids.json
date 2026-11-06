@@ -6,75 +6,88 @@
     "title": "us_exclude_screener",
     "tab": "combine",
     "url": "https://docs.google.com/spreadsheets/d/1M9Jpkylzru6UViTvpNjlDhpXs3FwKMNN5bNg9O_wHPs/edit",
-    "duplicate_tab": "Duplicate"
+    "duplicate_tab": "Duplicate",
+    "worksheet_gid": 2072131689,
+    "duplicate_worksheet_gid": 1931400910
   },
   "gates": {
     "01_mcdx": {
       "id": "1vci688aOjzHmwnENNBUYyHOclkRauVvuu0qWGajxVz0",
       "title": "exclude_01_mcdx",
       "label": "日線 MCDX 籌碼",
-      "tab": "exclude_01_mcdx"
+      "tab": "exclude_01_mcdx",
+      "worksheet_gid": 771593830
     },
     "02_ema200": {
       "id": "1SR7pr3YtELnLQkr38GlRyq-Yan9qK5MaLZq4AiSa3T0",
       "title": "exclude_02_ema200",
       "label": "日線 close < EMA200",
-      "tab": "exclude_02_ema200"
+      "tab": "exclude_02_ema200",
+      "worksheet_gid": 1629579053
     },
     "03_ema50": {
       "id": "1xIkCZVPgmE8aGfXa00ieG6f2vOLh3YPNvim9dqVJsPk",
       "title": "exclude_03_ema50",
       "label": "日線 close < EMA50",
-      "tab": "exclude_03_ema50"
+      "tab": "exclude_03_ema50",
+      "worksheet_gid": 1339770342
     },
     "04_mcap": {
       "id": "11FcPud9FfCKIJSjkTEyam4N3eBXZNRjYJ9duGbtQTMY",
       "title": "exclude_04_mcap",
       "label": "市值 < 100M",
-      "tab": "exclude_04_mcap"
+      "tab": "exclude_04_mcap",
+      "worksheet_gid": 1558374151
     },
     "05_td_daily": {
       "id": "1KzLFoQmK6AnOBB4ub9DLOJcPG69gk06RW_-UxNFAxBA",
       "title": "exclude_05_td_daily",
       "label": "日線 TD Sequential",
-      "tab": "exclude_05_td_daily"
+      "tab": "exclude_05_td_daily",
+      "worksheet_gid": 724307128
     },
     "06_td_weekly": {
       "id": "1VS53Ae3-DddOmJlffYWNbkZncBcQ8Sn_fno-l5aEzjs",
       "title": "exclude_06_td_weekly",
       "label": "週線 TD Sequential",
-      "tab": "exclude_06_td_weekly"
+      "tab": "exclude_06_td_weekly",
+      "worksheet_gid": 2070409393
     },
     "07_zhuli": {
       "id": "14wzhunQImWiqvU1MSEXgXL9k8szL5_WhEjiTx5ykQlQ",
       "title": "exclude_07_zhuli",
       "label": "週線主力能量",
-      "tab": "exclude_07_zhuli"
+      "tab": "exclude_07_zhuli",
+      "worksheet_gid": 1839639861
     },
     "08_kdj_weekly": {
       "id": "1Ai6NHjosaOksjvOe4yvhGcOGxqEcsmu3M7mzAOyLk2s",
       "title": "exclude_08_kdj_weekly",
       "label": "週線 KDJ 黃柱",
-      "tab": "exclude_08_kdj_weekly"
+      "tab": "exclude_08_kdj_weekly",
+      "worksheet_gid": 482038026
     },
     "09_kdj_monthly": {
       "id": "1mIXjO7C2SK-iFUz53VX78Mk98BUccYOzPcFQNZXnFCo",
       "title": "exclude_09_kdj_monthly",
       "label": "月線 KDJ 黃柱",
-      "tab": "exclude_09_kdj_monthly"
+      "tab": "exclude_09_kdj_monthly",
+      "worksheet_gid": 912283377
     },
     "10_sar_monthly": {
       "id": "1QSZ_n0E6j23nNMP2MIpYSSuwxwDolfP2PoAC4GBWP24",
       "title": "exclude_10_sar_monthly",
       "label": "月線 SAR 喺價上",
-      "tab": "exclude_10_sar_monthly"
+      "tab": "exclude_10_sar_monthly",
+      "worksheet_gid": 707290747
     },
     "11_zhuli_monthly": {
       "id": "1mDXjxBprbV4FU1wvpeGRkwFOz1pgnCKpHCAvfBD54K8",
       "title": "exclude_11_zhuli_monthly",
       "label": "月線主力能量",
       "tab": "exclude_11_zhuli_monthly",
-      "url": "https://docs.google.com/spreadsheets/d/1mDXjxBprbV4FU1wvpeGRkwFOz1pgnCKpHCAvfBD54K8/edit"
+      "url": "https://docs.google.com/spreadsheets/d/1mDXjxBprbV4FU1wvpeGRkwFOz1pgnCKpHCAvfBD54K8/edit",
+      "worksheet_gid": 0
     }
   },
   "notes": {
@@ -87,5 +100,10 @@
     "layout": "combine us_exclude_screener in processing; exclude_01–11 gate sheets in GROK/github. Action writes by spreadsheet file id."
   },
   "gates_folder_id": "1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A",
-  "gates_folder_url": "https://drive.google.com/drive/folders/1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A"
+  "gates_folder_url": "https://drive.google.com/drive/folders/1bysfp2HI3muZDbIYm_zI4gjhp7ir5g3A",
+  "metadata_binding": {
+    "bound_at": "2026-11-06T16:22:06+09:00",
+    "method": "Google Sheets get_spreadsheet readonly inventory",
+    "note": "Each gate spreadsheet has exactly one GRID tab whose title matches gates.*.tab. Main has combine + Duplicate (+ legacy exclude_* tabs not written by this writer). No cells written during binding."
+  }
 }

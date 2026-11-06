@@ -172,6 +172,37 @@ def universe() -> list[str]:
     return sorted(s for s in syms if s)
 
 
+def save_universe_provenance(out_dir: Path, urls: list[tuple[str, str]] | None = None) -> dict:
+    """Best-effort raw Nasdaq bytes + sha256 for future provenance (non-blocking)."""
+    import hashlib
+    out_dir.mkdir(parents=True, exist_ok=True)
+    urls = urls or [
+        ("nasdaqlisted.txt", NASDAQ_LISTED),
+        ("otherlisted.txt", OTHER_LISTED),
+    ]
+    info = {}
+    for name, url in urls:
+        try:
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            raw = resp.content
+            path = out_dir / name
+            path.write_bytes(raw)
+            info[name] = {
+                "url": url,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "bytes": len(raw),
+                "path": str(path.name),
+            }
+        except Exception as e:
+            info[name] = {"url": url, "error": str(e)}
+    (out_dir / "universe_provenance.json").write_text(
+        json.dumps(info, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return info
+
+
 def parse_syms(text: str) -> list[str]:
     out, seen = [], set()
     for p in text.replace(",", " ").split():
@@ -912,24 +943,136 @@ def write_local(gate_hits: dict[str, list[str]], out_dir: Path, asof: str) -> Pa
     return combine
 
 
-def maybe_write_sheets(gate_hits: dict[str, list[str]], sheet_ids_path: Path) -> None:
-    """Write to Google Sheets if GOOGLE_SERVICE_ACCOUNT_JSON is set."""
-    import os
+class SheetsConfigError(RuntimeError):
+    """Production Sheets path cannot proceed (SA / import / config)."""
 
+
+def write_failure_receipt(out_dir: Path, **fields) -> Path:
+    """Persist a failure sheets_receipt.json even when writes never started."""
+    from sheets_writer import _atomic_write_json
+
+    receipt = {
+        "status": fields.get("status", "failed"),
+        "sheets_write_attempted": bool(fields.get("sheets_write_attempted", False)),
+        "sheets_write_success": False,
+        "ready_for_sheets_prewrite": fields.get("ready_for_sheets_prewrite"),
+        "errors": list(fields.get("errors") or []),
+        "targets": fields.get("targets") or {},
+    }
+    path = out_dir / "sheets_receipt.json"
+    _atomic_write_json(path, receipt)
+    return path
+
+
+def maybe_write_sheets(
+    gate_hits: dict[str, list[str]],
+    sheet_ids_path: Path,
+    *,
+    out_dir: Path,
+    ready_for_sheets_prewrite: bool,
+) -> dict:
+    """Production Sheets write path — never silent-skip.
+
+    Requires GOOGLE_SERVICE_ACCOUNT_JSON, importable sheets_writer, and a complete
+    13-target config. Returns the sheets_receipt dict. Raises on any failure.
+    """
+    import os
+    from sheets_writer import (
+        SheetsWriteError,
+        list_targets_from_config,
+        preflight_sheet_targets,
+        write_all_gates,
+    )
+
+    receipt_path = out_dir / "sheets_receipt.json"
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if not sa_json:
-        print("Sheets: skip (no GOOGLE_SERVICE_ACCOUNT_JSON)", flush=True)
-        return
+        cfg0 = {"gates": {}, "combine": {}}
+        if sheet_ids_path.exists():
+            try:
+                cfg0 = json.loads(sheet_ids_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        write_failure_receipt(
+            out_dir,
+            status="failed_missing_sa",
+            sheets_write_attempted=False,
+            ready_for_sheets_prewrite=ready_for_sheets_prewrite,
+            errors=["GOOGLE_SERVICE_ACCOUNT_JSON empty — production path cannot skip"],
+            targets={
+                t["key"]: {
+                    "status": "not_attempted",
+                    "spreadsheet_id": t.get("spreadsheet_id"),
+                    "tab": t.get("tab"),
+                    "error": "missing SA",
+                }
+                for t in list_targets_from_config(cfg0, GATE_ORDER)
+            },
+        )
+        raise SheetsConfigError(
+            "FAIL_CLOSED: GOOGLE_SERVICE_ACCOUNT_JSON required when not --skip-sheets"
+        )
+
     try:
-        from sheets_writer import write_all_gates
-    except ImportError:
-        print("Sheets: sheets_writer import failed", flush=True)
-        return
-    cfg = json.loads(sheet_ids_path.read_text(encoding="utf-8"))
-    write_all_gates(
-        sa_json, cfg, gate_hits, GATE_LABELS, GATE_ORDER,
-        dup_priority=DUP_GATE_PRIORITY,
-    )
+        cfg = json.loads(sheet_ids_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        write_failure_receipt(
+            out_dir,
+            status="failed_config",
+            sheets_write_attempted=False,
+            ready_for_sheets_prewrite=ready_for_sheets_prewrite,
+            errors=[f"sheet_ids load failed: {e}"],
+        )
+        raise SheetsConfigError(f"FAIL_CLOSED: cannot load sheet_ids: {e}") from e
+
+    try:
+        preflight_sheet_targets(cfg, GATE_ORDER)
+    except Exception as e:
+        write_failure_receipt(
+            out_dir,
+            status="failed_preflight",
+            sheets_write_attempted=False,
+            ready_for_sheets_prewrite=ready_for_sheets_prewrite,
+            errors=[str(e)],
+            targets={
+                t["key"]: {
+                    "status": "not_attempted",
+                    "spreadsheet_id": t.get("spreadsheet_id"),
+                    "tab": t.get("tab"),
+                    "error": str(e),
+                }
+                for t in list_targets_from_config(cfg, GATE_ORDER)
+            },
+        )
+        raise
+
+    try:
+        receipt = write_all_gates(
+            sa_json,
+            cfg,
+            gate_hits,
+            GATE_LABELS,
+            GATE_ORDER,
+            dup_priority=DUP_GATE_PRIORITY,
+            receipt_path=receipt_path,
+        )
+    except SheetsWriteError:
+        raise
+    except Exception as e:
+        write_failure_receipt(
+            out_dir,
+            status="failed_unexpected",
+            sheets_write_attempted=True,
+            ready_for_sheets_prewrite=ready_for_sheets_prewrite,
+            errors=[str(e)],
+        )
+        raise SheetsWriteError(f"FAIL_CLOSED: {e}") from e
+
+    receipt["ready_for_sheets_prewrite"] = ready_for_sheets_prewrite
+    from sheets_writer import _atomic_write_json
+
+    _atomic_write_json(receipt_path, receipt)
+    return receipt
 
 
 def main() -> int:
@@ -1029,6 +1172,7 @@ def main() -> int:
     asof = ny_now().strftime("%Y-%m-%d %H:%M ET")
     out_dir = Path(args.out_dir)
     write_local(gate_hits, out_dir, asof)
+    universe_prov = save_universe_provenance(out_dir)
 
     sheet_target_plan = {
         "policy": "owner_readme_sheet_ids",
@@ -1139,25 +1283,86 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    if not args.skip_sheets:
-        if not ready_for_sheets:
-            print(
-                "Sheets: BLOCKED — " + "; ".join(block_reasons),
-                flush=True,
+    sheets_write_success = False
+    sheets_receipt_status = "not_attempted"
+    if args.skip_sheets:
+        sheets_receipt_status = "skipped_explicit"
+        write_failure_receipt(
+            out_dir,
+            status="skipped_explicit",
+            sheets_write_attempted=False,
+            ready_for_sheets_prewrite=ready_for_sheets,
+            errors=["--skip-sheets set (local/CI only; not a production success)"],
+            targets={
+                f"gate_{k}": {"status": "not_attempted", "error": "skip-sheets"}
+                for k in GATE_ORDER
+            }
+            | {
+                "combine": {"status": "not_attempted", "error": "skip-sheets"},
+                "Duplicate": {"status": "not_attempted", "error": "skip-sheets"},
+            },
+        )
+        print("Sheets: skipped (--skip-sheets)", flush=True)
+    elif not ready_for_sheets:
+        sheets_receipt_status = "blocked_prewrite"
+        write_failure_receipt(
+            out_dir,
+            status="blocked_prewrite",
+            sheets_write_attempted=False,
+            ready_for_sheets_prewrite=False,
+            errors=list(block_reasons),
+        )
+        print("Sheets: BLOCKED — " + "; ".join(block_reasons), flush=True)
+    else:
+        try:
+            receipt = maybe_write_sheets(
+                gate_hits,
+                Path(args.sheet_ids),
+                out_dir=out_dir,
+                ready_for_sheets_prewrite=True,
             )
-        else:
-            maybe_write_sheets(gate_hits, Path(args.sheet_ids))
+            sheets_write_success = bool(receipt.get("sheets_write_success"))
+            sheets_receipt_status = receipt.get("status") or (
+                "success" if sheets_write_success else "failed"
+            )
+        except Exception as e:
+            sheets_receipt_status = "failed"
+            sheets_write_success = False
+            print(f"Sheets: FAIL_CLOSED {e}", flush=True)
+            block_reasons.append(f"sheets_write_failed:{e}")
+
+    # Distinguish pre-write readiness from actual successful write+readback.
+    run_outcome["ready_for_sheets"] = ready_for_sheets  # pre-write gate only
+    run_outcome["ready_for_sheets_prewrite"] = ready_for_sheets
+    run_outcome["sheets_write_attempted"] = (not args.skip_sheets) and ready_for_sheets
+    run_outcome["sheets_write_success"] = sheets_write_success
+    run_outcome["sheets_receipt_status"] = sheets_receipt_status
+    (out_dir / "run_outcome.json").write_text(
+        json.dumps(run_outcome, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     for k in GATE_ORDER:
         print(f"COUNT {k}={len(set(gate_hits[k]))} ({GATE_LABELS[k]})", flush=True)
 
-    if block_reasons:
+    if block_reasons or not (
+        args.skip_sheets or sheets_write_success
+    ):
+        # Production path without --skip-sheets must have sheets_write_success.
+        if not args.skip_sheets and not sheets_write_success and not block_reasons:
+            block_reasons.append("sheets_write_not_confirmed")
         print(
-            "EXIT_FAIL_CLOSED " + "; ".join(block_reasons)
-            + " (local artifacts written; Sheets blocked; workflow must not look green)",
+            "EXIT_FAIL_CLOSED " + "; ".join(block_reasons or ["sheets_incomplete"])
+            + " (local artifacts/receipt written; workflow must not look green)",
             flush=True,
         )
         return 1
+    # --skip-sheets local/CI: data gates passed; sheets intentionally not written.
+    if args.skip_sheets:
+        print(
+            "EXIT_OK_SKIP_SHEETS (data gates passed; Sheets not written by request)",
+            flush=True,
+        )
     return 0
 
 if __name__ == "__main__":
