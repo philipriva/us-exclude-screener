@@ -412,45 +412,116 @@ def fetch_mcap(sym: str) -> float | None:
     return None
 
 
-def download(syms: list[str]) -> dict[str, pd.DataFrame]:
+# --- Yahoo download throttling / rate-limit retry (Philip 2026-11-11) ---------
+# Only the price-download path changed; gates, thresholds, universe and Sheet
+# targets are untouched. Coverage is logged as information only (no guard).
+DL_PAUSE_SEC = 1.5          # pause between main-pass batches
+DL_COOLDOWN_BASE = 20.0     # cooldown when a batch looks rate-limited
+DL_COOLDOWN_MAX = 120.0
+RETRY_ROUNDS = 4            # rounds for still-missing tickers
+RETRY_BATCH = 50
+RETRY_PAUSE_SEC = 2.0
+RETRY_BACKOFF_BASE = 30.0   # 30, 60, 120, 240 s before rounds 1..4
+RETRY_BUDGET_SEC = 75 * 60  # hard cap on all retry rounds (job timeout 300 min)
+
+
+def _yf_batch(bt: list[str]):
+    raw = None
+    for a in range(3):
+        try:
+            raw = yf.download(
+                bt,
+                period=PERIOD,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=True,
+                threads=True,
+                progress=False,
+            )
+            break
+        except Exception as e:
+            print("retry", a, e, flush=True)
+            time.sleep(1.5 * (a + 1))
+    return raw
+
+
+def _extract(raw, bt: list[str]) -> dict[str, pd.DataFrame]:
+    got: dict[str, pd.DataFrame] = {}
+    if raw is None or raw.empty:
+        return got
+    for s in bt:
+        try:
+            d = raw[s] if len(bt) > 1 else raw
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(-1)
+            # auto_adjust may drop Adj Close; need OHLC
+            need = [c for c in ("Open", "High", "Low", "Close") if c in d.columns]
+            if len(need) < 4:
+                continue
+            d = d.dropna(subset=["Close", "High", "Low"])
+            if not d.empty:
+                got[s] = d
+        except Exception:
+            pass
+    return got
+
+
+def _looks_rate_limited(n_req: int, n_got: int) -> bool:
+    """Empty/short batch → treat as rate limit (yfinance swallows the 429)."""
+    return n_req >= 10 and n_got < n_req * 0.5
+
+
+def download(
+    syms: list[str],
+    *,
+    fetch=None,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> dict[str, pd.DataFrame]:
+    fetch = fetch or _yf_batch
     out: dict[str, pd.DataFrame] = {}
     n = len(syms)
+    cooldown = DL_COOLDOWN_BASE
     for i in range(0, n, BATCH):
         bt = syms[i : i + BATCH]
         print(f"download {min(i + BATCH, n)}/{n}", flush=True)
-        raw = None
-        for a in range(3):
-            try:
-                raw = yf.download(
-                    bt,
-                    period=PERIOD,
-                    interval="1d",
-                    group_by="ticker",
-                    auto_adjust=True,
-                    threads=True,
-                    progress=False,
-                )
+        got = _extract(fetch(bt), bt)
+        out.update(got)
+        if _looks_rate_limited(len(bt), len(got)):
+            print(f"  rate-limit suspected ({len(got)}/{len(bt)}); cooldown {cooldown:.0f}s", flush=True)
+            sleep(cooldown)
+            cooldown = min(cooldown * 2, DL_COOLDOWN_MAX)
+        else:
+            cooldown = DL_COOLDOWN_BASE
+        sleep(DL_PAUSE_SEC)
+    print(f"coverage after main pass: {len(out)}/{n} missing={n - len(out)}", flush=True)
+
+    t0 = clock()
+    for rnd in range(1, RETRY_ROUNDS + 1):
+        missing = [s for s in syms if s not in out]
+        if not missing:
+            break
+        wait = RETRY_BACKOFF_BASE * (2 ** (rnd - 1))
+        if clock() - t0 + wait > RETRY_BUDGET_SEC:
+            print(f"retry budget reached before round {rnd}; stop", flush=True)
+            break
+        print(f"retry round {rnd}/{RETRY_ROUNDS}: missing={len(missing)} backoff {wait:.0f}s", flush=True)
+        sleep(wait)
+        recovered = 0
+        for j in range(0, len(missing), RETRY_BATCH):
+            if clock() - t0 > RETRY_BUDGET_SEC:
+                print("retry budget reached mid-round; stop", flush=True)
                 break
-            except Exception as e:
-                print("retry", a, e, flush=True)
-                time.sleep(1.5 * (a + 1))
-        if raw is None or raw.empty:
-            continue
-        for s in bt:
-            try:
-                d = raw[s] if len(bt) > 1 else raw
-                if isinstance(d.columns, pd.MultiIndex):
-                    d.columns = d.columns.get_level_values(-1)
-                # auto_adjust may drop Adj Close; need OHLC
-                need = [c for c in ("Open", "High", "Low", "Close") if c in d.columns]
-                if len(need) < 4:
-                    continue
-                d = d.dropna(subset=["Close", "High", "Low"])
-                if not d.empty:
-                    out[s] = d
-            except Exception:
-                pass
-        time.sleep(0.15)
+            bt = missing[j : j + RETRY_BATCH]
+            got = _extract(fetch(bt), bt)
+            out.update(got)
+            recovered += len(got)
+            sleep(RETRY_PAUSE_SEC)
+        print(f"  round {rnd} recovered={recovered} coverage={len(out)}/{n}", flush=True)
+        if recovered == 0 and rnd >= 2:
+            # Nothing came back twice in a row → remaining are likely delisted/no data.
+            break
+    print(f"COVERAGE (info only) downloaded={len(out)}/{n} missing={n - len(out)}", flush=True)
     return out
 
 
