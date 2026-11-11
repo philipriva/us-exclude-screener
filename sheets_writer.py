@@ -52,10 +52,29 @@ def _first_worksheet(sh):
     return sh.get_worksheet(0)
 
 
+RESIZE_MARGIN_ROWS = 1000
+
+
+def _ensure_grid(ws, need_rows: int, need_cols: int, margin: int = RESIZE_MARGIN_ROWS) -> None:
+    """Grow the worksheet grid if it cannot hold need_rows x need_cols. Never shrinks."""
+    cur_rows = int(getattr(ws, "row_count", 0) or 0)
+    cur_cols = int(getattr(ws, "col_count", 0) or 0)
+    new_rows = cur_rows if cur_rows >= need_rows else need_rows + margin
+    new_cols = cur_cols if cur_cols >= need_cols else need_cols
+    if new_rows == cur_rows and new_cols == cur_cols:
+        return
+    print(
+        f"Sheets: resize {getattr(ws, 'title', '?')} {cur_rows}x{cur_cols} -> {new_rows}x{new_cols}",
+        flush=True,
+    )
+    ws.resize(rows=new_rows, cols=new_cols)
+
+
 def _clear_and_write(ws, rows: list[list[Any]]) -> None:
     ws.clear()
     if not rows:
         return
+    _ensure_grid(ws, len(rows), max(len(r) for r in rows))
     # write in chunks by row
     start = 0
     while start < len(rows):
@@ -136,6 +155,8 @@ def _write_duplicate(
     except Exception:
         ws.clear()
     print(f"Sheets: write Duplicate n={len(dup_rows)}", flush=True)
+    # A:B data rows; D1:D2 docs → need >= 4 columns.
+    _ensure_grid(ws, max(len(dup_rows), 2), 4)
     if dup_rows:
         start = 0
         while start < len(dup_rows):
