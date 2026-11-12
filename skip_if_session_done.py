@@ -15,40 +15,17 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
 
-NY = ZoneInfo("America/New_York")
+from marketdata import (
+    NY,
+    last_complete_us_session_date,
+    ny_now,
+    session_close_utc,
+)
+
 DEFAULT_EVENTS = ("schedule", "workflow_dispatch", "workflow_run", "repository_dispatch")
-
-
-def ny_now(now: Optional[datetime] = None) -> datetime:
-    if now is None:
-        return datetime.now(NY)
-    if now.tzinfo is None:
-        return now.replace(tzinfo=NY)
-    return now.astimezone(NY)
-
-
-def last_complete_us_session_date(now: Optional[datetime] = None) -> date:
-    """Prior complete US cash session date (America/New_York).
-
-    After 16:00 ET, today's daily bar is complete → expect today (weekdays).
-    Before 16:00 ET, expect the previous weekday. Weekends roll back to Friday.
-    """
-    now = ny_now(now)
-    d = now.date()
-    if (now.hour, now.minute) < (16, 0):
-        d = d - timedelta(days=1)
-    while d.weekday() >= 5:
-        d = d - timedelta(days=1)
-    return d
-
-
-def session_close_utc(session: date) -> datetime:
-    """16:00 America/New_York on ``session`` as an aware UTC datetime."""
-    return datetime(session.year, session.month, session.day, 16, 0, tzinfo=NY).astimezone(timezone.utc)
 
 
 def already_succeeded(

@@ -35,6 +35,15 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from marketdata import (
+    MIN_FRESH_FRAC,
+    _merge_yahoo,
+    download_daily,
+    format_status,
+    last_bar_date,
+    last_complete_us_session_date,
+)
+
 NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 N, SMA, BATCH = 100, 10, 150
@@ -670,6 +679,44 @@ def main() -> int:
 
     data = download(syms)
     print(f"data={len(data)}", flush=True)
+
+    expected = last_complete_us_session_date()
+    stale_or_missing = [
+        s for s in syms
+        if last_bar_date(data.get(s)) != expected
+    ]
+    yahoo_fresh = len(syms) - len(stale_or_missing)
+    retry = stooq = 0
+    if stale_or_missing:
+        print(f"stale/missing after main pass: {len(stale_or_missing)}; Yahoo 5d + Stooq gap-fill", flush=True)
+        extra, st = download_daily(stale_or_missing, expected, period="5d", batch_size=50, pause_sec=RETRY_PAUSE_SEC)
+        retry, stooq = st.retry + st.yahoo, st.stooq  # 5d main counts as yahoo-retry
+        for s, fr in extra.items():
+            data[s] = _merge_yahoo(data.get(s), fr)
+    fresh_n = sum(1 for s in syms if last_bar_date(data.get(s)) == expected)
+    denom_n = len(syms)
+    frac = (fresh_n / denom_n) if denom_n else 0.0
+    fresh_ok = denom_n > 0 and frac >= MIN_FRESH_FRAC
+    print(
+        format_status(
+            session=expected,
+            writer="us-exclude",
+            fresh=fresh_n,
+            denom=denom_n or 1,
+            yahoo=yahoo_fresh,
+            retry=retry,
+            stooq=stooq,
+            result="BLOCKED" if not fresh_ok else "WROTE",
+        ),
+        flush=True,
+    )
+    if not fresh_ok:
+        print(
+            f"BLOCKED (freshness < {MIN_FRESH_FRAC}): fresh={fresh_n}/{denom_n}={frac:.4f} — Sheets not written",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 3
 
     gate_hits: dict[str, list[str]] = {k: [] for k in GATE_ORDER}
     for i, (s, d) in enumerate(data.items()):
