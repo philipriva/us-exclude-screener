@@ -10,7 +10,19 @@ on:
     # During EST (UTC-5) the same UTC cron is 17:00 ET = close+1h (GitHub UTC limitation;
     # still after close, still before 09:00 HKT). Optional EST shift: 0 23 * * 1-5.
     - cron: "0 22 * * 1-5"
+    # Morning backups (Philip t337u): odd minutes, finish before 11:00 JST
+    # (job 20–47 min). 08:23 JST Tue–Sat; 09:37 JST Tue–Sat.
+    - cron: "23 23 * * 1-5"
+    - cron: "37 0 * * 2-6"
   workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: daily-exclude-screener
+  cancel-in-progress: false
 
 jobs:
   screen:
@@ -18,16 +30,26 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+      - name: Skip if session already succeeded
+        id: already
+        if: github.event_name == 'schedule'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 skip_if_session_done.py --workflow daily_exclude.yml
       - uses: actions/setup-python@v5
+        if: steps.already.outputs.skip != 'true'
         with:
           python-version: "3.12"
       - name: Install deps
+        if: steps.already.outputs.skip != 'true'
         run: pip install -r requirements.txt
       - name: Run 11-gate exclude screener
+        if: steps.already.outputs.skip != 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python run_exclude.py --out-dir out
       - name: Upload gate artifacts
+        if: steps.already.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: exclude_gates
