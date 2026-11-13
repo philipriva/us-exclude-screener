@@ -3,19 +3,16 @@ name: Daily Exclude Screener (11 gates → Sheets)
 on:
   schedule:
     # GitHub Actions cron is UTC only (no CRON_TZ).
-    # Intent: US cash equity close + 2 hours, Mon–Fri; finish before 09:00 Asia/Hong_Kong.
-    # Same pattern as ExtraScan QQscan:
-    #   0 22 * * 1-5 ≈ 18:00 America/New_York during EDT (UTC-4) = close+2h
-    #   → ~06:00 HKT next calendar morning; job ~24–40min ⇒ well before 09:00 HKT.
-    # During EST (UTC-5) the same UTC cron is 17:00 ET = close+1h (GitHub UTC limitation;
-    # still after close, still before 09:00 HKT). Optional EST shift: 0 23 * * 1-5.
-    - cron: "0 22 * * 1-5"
-    # Morning backups (Philip t337u): odd minutes, finish before 11:00 JST
-    # (job 20–47 min). 08:23 JST Tue–Sat; 09:37 JST Tue–Sat.
-    - cron: "23 23 * * 1-5"
-    - cron: "37 0 * * 2-6"
-    # Late backup 15:00 JST Tue–Sat (Yahoo last-bar often incomplete earlier).
-    - cron: "0 6 * * 2-6"
+    # Staggered after Daily 06:30, CDEF ~07:05, and Zhuli 08:33 JST
+    # (~35 min full-universe Yahoo job). Finish is after the old 09:00 HKT
+    # target; morning + late backups still cover a missed primary.
+    # During EST (UTC-5) 09:13 JST is 19:13 ET (close+3h13).
+    - cron: "13 0 * * 2-6"
+    # Mid backups: 12:58 / 13:34 JST Tue–Sat (offset from Zhuli/Strong mids).
+    - cron: "58 3 * * 2-6"
+    - cron: "34 4 * * 2-6"
+    # Late backup 17:42 JST Tue–Sat (staggered 15:00 Yahoo ladder).
+    - cron: "42 8 * * 2-6"
   workflow_dispatch:
 
 permissions:
