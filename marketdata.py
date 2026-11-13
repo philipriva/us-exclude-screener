@@ -155,16 +155,31 @@ def _stdlib_is_early_close(d: date) -> bool:
     return False
 
 
+# pandas_market_calendars get_calendar+schedule is expensive (~50–80ms).
+# last_bar_date/drop_forming used to call this once per symbol, which burned
+# ~7 min per freshness pass on a 6.6k universe and expired the 6 min retry
+# budget before any 5d retry started (Zhuli 43345042225, 2026-11-13).
+_MCAL_SCHED_CACHE: dict[date, object] = {}
+_MCAL_UNAVAILABLE = object()
+_SESSION_CLOSE_CACHE: dict[date, datetime] = {}
+
+
 def _mcal_schedule(d: date):
+    if d in _MCAL_SCHED_CACHE:
+        cached = _MCAL_SCHED_CACHE[d]
+        return None if cached is _MCAL_UNAVAILABLE else cached
     try:
         import pandas_market_calendars as mcal
     except Exception:
+        _MCAL_SCHED_CACHE[d] = _MCAL_UNAVAILABLE
         return None
     try:
         nyse = mcal.get_calendar("XNYS")
         sched = nyse.schedule(start_date=d.isoformat(), end_date=d.isoformat())
+        _MCAL_SCHED_CACHE[d] = sched
         return sched
     except Exception:
+        _MCAL_SCHED_CACHE[d] = _MCAL_UNAVAILABLE
         return None
 
 
@@ -177,12 +192,18 @@ def is_nyse_trading_day(d: date) -> bool:
 
 def session_close_datetime(session: date) -> datetime:
     """Official NYSE cash close in America/New_York (16:00, or 13:00 early close)."""
+    cached = _SESSION_CLOSE_CACHE.get(session)
+    if cached is not None:
+        return cached
     sched = _mcal_schedule(session)
     if sched is not None and len(sched) > 0:
         close = sched.iloc[0]["market_close"]
-        return close.tz_convert(NY).to_pydatetime()
-    hour, minute = (13, 0) if _stdlib_is_early_close(session) else (16, 0)
-    return datetime(session.year, session.month, session.day, hour, minute, tzinfo=NY)
+        out = close.tz_convert(NY).to_pydatetime()
+    else:
+        hour, minute = (13, 0) if _stdlib_is_early_close(session) else (16, 0)
+        out = datetime(session.year, session.month, session.day, hour, minute, tzinfo=NY)
+    _SESSION_CLOSE_CACHE[session] = out
+    return out
 
 
 def session_close_utc(session: date) -> datetime:

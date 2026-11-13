@@ -371,3 +371,17 @@ def test_stooq_budget_stops_after_cap():
     assert calls == ["AAA"]
     assert stats.stooq == 1
     assert stats.fresh == 1 and stats.stale_after == 2
+
+
+def test_last_bar_date_is_fast_on_large_universe():
+    """session_close must be cached; a 2k-symbol freshness pass should be << seconds."""
+    import time as _t
+
+    stale = _frame([10, 11], start="2026-11-09")  # ends 11-10
+    frames = {f"S{i}": stale.copy() for i in range(2000)}
+    now = datetime(2026, 11, 12, 20, 0, tzinfo=NY)
+    t0 = _t.monotonic()
+    dates = [m.last_bar_date(fr, now=now) for fr in frames.values()]
+    elapsed = _t.monotonic() - t0
+    assert dates == [date(2026, 11, 10)] * 2000
+    assert elapsed < 2.0, f"last_bar_date over 2000 frames took {elapsed:.2f}s (calendar not cached?)"
