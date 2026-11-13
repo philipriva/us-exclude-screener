@@ -25,6 +25,7 @@ before pip install on GitHub Actions.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Iterable, Optional
@@ -36,8 +37,15 @@ LOOKBACK_DAYS = 1500
 DEFAULT_BATCH = 100
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_BACKOFF_SEC = 2.0
-SYMBOL_RETRY_RETRIES = 3
-STOOQ_TIMEOUT_SEC = 20
+SYMBOL_RETRY_RETRIES = 1  # empty/delisted: do not triple-retry
+STOOQ_TIMEOUT_SEC = 10.0
+REQUEST_TIMEOUT_SEC = 10.0
+YF_BATCH_TIMEOUT_SEC = 45.0
+YF_RETRY_BUDGET_SEC = 360.0  # 5d batches + Ticker.history wall clock
+STOOQ_BUDGET_SEC = 360.0
+RETRY_CONCURRENCY = 8
+MAX_HISTORY_SYMBOLS = 400
+MAX_STOOQ_SYMBOLS = 400
 
 # One-off full-session closures not produced by the standard NYSE rule set.
 # 2025-01-09: National Day of Mourning (President Carter).
@@ -520,6 +528,41 @@ def _append_stooq_gaps(yahoo_df, stooq_df, expected: date):
     return out, len(add_rows)
 
 
+
+def _prioritize_pending(pending: list[str], out: dict) -> list[str]:
+    """Retry stale-with-Yahoo-history first; missing/delisted last."""
+    has, miss = [], []
+    for s in pending:
+        fr = out.get(s)
+        if fr is not None and not getattr(fr, "empty", True):
+            has.append(s)
+        else:
+            miss.append(s)
+    return has + miss
+
+
+def _budget_left(clock: Callable, start: float, budget: float) -> float:
+    return budget - (clock() - start)
+
+
+def _run_with_timeout(fn: Callable, timeout: float, *args, **kwargs):
+    """Call fn; return None on timeout or exception.
+
+    The worker thread may outlive the timeout (yfinance has no cancel);
+    the caller moves on so a single hung request cannot stall the budget.
+    """
+    if timeout is None or timeout <= 0:
+        return None
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(fn, *args, **kwargs)
+        return fut.result(timeout=timeout)
+    except Exception:
+        return None
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
 def _needs_retry(frame, expected: date, now: Optional[datetime]) -> bool:
     lb = last_bar_date(frame, now=now)
     return lb is None or lb != expected
@@ -538,10 +581,22 @@ def download_daily(
     yf_history: Optional[Callable] = None,
     stooq_fetch: Optional[Callable] = None,
     sleep: Callable = time.sleep,
+    clock: Callable = time.monotonic,
+    retry_budget_sec: float = YF_RETRY_BUDGET_SEC,
+    stooq_budget_sec: float = STOOQ_BUDGET_SEC,
+    request_timeout_sec: float = REQUEST_TIMEOUT_SEC,
+    batch_timeout_sec: float = YF_BATCH_TIMEOUT_SEC,
+    retry_concurrency: int = RETRY_CONCURRENCY,
 ) -> tuple[dict, DownloadStats]:
     """Fetch daily bars; Yahoo primary, Stooq only fills last-session gaps.
 
-    yf_download / yf_history / stooq_fetch are injectable for tests.
+    yf_download / yf_history / stooq_fetch / sleep / clock are injectable for tests.
+
+    After the main Yahoo batch, the 5d + Ticker.history retry phase is hard-capped
+    at ``retry_budget_sec`` (default 6 min). The Stooq gap-fill phase is separately
+    capped at ``stooq_budget_sec``. Per-request timeouts apply to Yahoo history
+    and Stooq HTTP. When a budget is exhausted, leftover symbols stay as they
+    are and the caller evaluates the .90 freshness gate on whatever was fetched.
     """
     syms = [str(s).strip() for s in symbols if str(s).strip()]
     stats = DownloadStats(requested=len(syms))
@@ -553,6 +608,9 @@ def download_daily(
     hist_fn = yf_history
     stooq_fn = stooq_fetch if stooq_fetch is not None else _fetch_stooq
 
+    def _fetch_batch(tickers, **kw):
+        return _run_with_timeout(fetch, batch_timeout_sec, tickers, **kw)
+
     # --- 1) main Yahoo batch ---
     n = len(syms)
     for i in range(0, n, batch_size):
@@ -561,8 +619,11 @@ def download_daily(
         got = {}
         for attempt in range(DOWNLOAD_RETRIES):
             try:
-                raw = fetch(bt, period=period, lookback_days=lookback_days, threads=True)
-                got = _extract_batch_frames(raw, bt)
+                raw = _fetch_batch(bt, period=period, lookback_days=lookback_days, threads=True)
+                if raw is None:
+                    got = {}
+                else:
+                    got = _extract_batch_frames(raw, bt)
                 if len(got) >= max(1, int(len(bt) * 0.5)):
                     break
                 print(
@@ -586,15 +647,39 @@ def download_daily(
     stats.yahoo = sum(1 for s in syms if s in out and not _needs_retry(out[s], expected_session, now))
 
     # --- 2) stale / missing: period=5d small batches, then Ticker.history ---
-    pending = [s for s in syms if s not in out or _needs_retry(out.get(s), expected_session, now)]
+    # Hard wall-clock budget for this whole Yahoo retry phase.
+    retry_start = clock()
+
+    def retry_left() -> float:
+        return _budget_left(clock, retry_start, retry_budget_sec)
+
+    pending = _prioritize_pending(
+        [s for s in syms if s not in out or _needs_retry(out.get(s), expected_session, now)],
+        out,
+    )
     if pending:
-        print(f"stale/missing after main pass: {len(pending)}; Yahoo period=5d retry", flush=True)
+        print(
+            f"stale/missing after main pass: {len(pending)}; Yahoo period=5d retry "
+            f"(budget {retry_budget_sec:.0f}s)",
+            flush=True,
+        )
         retry_batch = 50
         for i in range(0, len(pending), retry_batch):
+            if retry_left() <= 0:
+                left = len(pending) - i
+                print(
+                    f"Yahoo 5d retry budget exhausted after {clock() - retry_start:.0f}s; "
+                    f"skipping {left} symbols",
+                    flush=True,
+                )
+                break
             bt = pending[i : i + retry_batch]
+            timeout = min(batch_timeout_sec, max(0.1, retry_left()))
             try:
-                raw = fetch(bt, period="5d", lookback_days=lookback_days, threads=True)
-                got = _extract_batch_frames(raw, bt)
+                raw = _run_with_timeout(
+                    fetch, timeout, bt, period="5d", lookback_days=lookback_days, threads=True
+                )
+                got = _extract_batch_frames(raw, bt) if raw is not None else {}
             except Exception as e:
                 print(f"  5d batch error: {e}", flush=True)
                 got = {}
@@ -605,57 +690,125 @@ def download_daily(
                     stats.retry += 1
                 elif s in out:
                     out[s] = merged  # keep merged even if still stale (may help stooq splice)
-            sleep(DOWNLOAD_BACKOFF_SEC)
+            if pause_sec:
+                sleep(min(pause_sec, max(0.0, retry_left())))
 
-    still = [s for s in syms if s not in out or _needs_retry(out.get(s), expected_session, now)]
-    if still:
-        print(f"per-symbol Ticker.history retry: {len(still)}", flush=True)
+    still = _prioritize_pending(
+        [s for s in syms if s not in out or _needs_retry(out.get(s), expected_session, now)],
+        out,
+    )
+    if still and retry_left() > 0:
+        # Prefer names that already have Yahoo history; cap how many we poke.
+        cap = min(len(still), MAX_HISTORY_SYMBOLS)
+        todo = still[:cap]
+        print(
+            f"per-symbol Ticker.history retry: {len(todo)}/{len(still)} "
+            f"(budget left {retry_left():.0f}s, concurrency {retry_concurrency})",
+            flush=True,
+        )
         if hist_fn is None:
             def hist_fn(sym: str):
                 import yfinance as yf
 
                 return yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=True)
 
-        for s in still:
-            ok = False
-            for attempt in range(SYMBOL_RETRY_RETRIES):
-                try:
-                    short = hist_fn(s)
-                    if short is None or getattr(short, "empty", True):
-                        sleep(DOWNLOAD_BACKOFF_SEC * (attempt + 1))
+        def _hist_one(s: str):
+            try:
+                short = _run_with_timeout(hist_fn, request_timeout_sec, s)
+                if short is None or getattr(short, "empty", True):
+                    return s, None, False
+                merged = _merge_yahoo(out.get(s), short)
+                recovered = not _needs_retry(merged, expected_session, now)
+                return s, merged, recovered
+            except Exception as e:
+                print(f"  {s}: history error {e}", flush=True)
+                return s, None, False
+
+        workers = max(1, int(retry_concurrency) or 1)
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for i in range(0, len(todo), workers):
+                if retry_left() <= 0:
+                    print(
+                        f"Yahoo history retry budget exhausted after {clock() - retry_start:.0f}s; "
+                        f"submitted {done}/{len(todo)}",
+                        flush=True,
+                    )
+                    break
+                chunk = todo[i : i + workers]
+                futs = [pool.submit(_hist_one, s) for s in chunk]
+                done += len(chunk)
+                for fut in futs:
+                    left = retry_left()
+                    try:
+                        s, merged, recovered = fut.result(timeout=max(0.1, left + request_timeout_sec))
+                    except Exception:
                         continue
-                    merged = _merge_yahoo(out.get(s), short)
+                    if merged is None:
+                        continue
                     out[s] = merged
-                    if not _needs_retry(merged, expected_session, now):
+                    if recovered:
                         stats.retry += 1
-                        ok = True
-                        break
-                except Exception as e:
-                    print(f"  {s}: history error {e} (retry {attempt + 1})", flush=True)
-                sleep(DOWNLOAD_BACKOFF_SEC * (attempt + 1))
-            # ok unused; still-stale goes to Stooq
+    elif still:
+        print(
+            f"Yahoo retry budget exhausted; skipping Ticker.history for {len(still)} symbols",
+            flush=True,
+        )
 
     # --- 3) Stooq gap-fill only onto existing Yahoo history ---
-    still = [s for s in syms if s not in out or _needs_retry(out.get(s), expected_session, now)]
+    still = _prioritize_pending(
+        [s for s in syms if s not in out or _needs_retry(out.get(s), expected_session, now)],
+        out,
+    )
+    # Stooq can only splice onto an existing Yahoo prefix.
+    still = [s for s in still if s in out and out[s] is not None and not getattr(out[s], "empty", True)]
+    stooq_start = clock()
     if still:
-        print(f"stooq gap-fill (Yahoo prefix required): {len(still)}", flush=True)
-        for s in still:
-            if s not in out or out[s] is None or getattr(out[s], "empty", True):
-                # No Yahoo history — do not replace with Stooq.
-                continue
+        cap = min(len(still), MAX_STOOQ_SYMBOLS)
+        todo = still[:cap]
+        print(
+            f"stooq gap-fill (Yahoo prefix required): {len(todo)}/{len(still)} "
+            f"(budget {stooq_budget_sec:.0f}s)",
+            flush=True,
+        )
+
+        def _stooq_one(s: str):
             try:
-                sdf = stooq_fn(s)
+                sdf = _run_with_timeout(stooq_fn, request_timeout_sec, s)
             except Exception as e:
                 print(f"  stooq {s}: {e}", flush=True)
-                continue
+                return s, None, 0
             if sdf is None:
-                continue
+                return s, None, 0
             merged, n_add = _append_stooq_gaps(out[s], sdf, expected_session)
-            if n_add:
-                print(f"  stooq {s}: appended {n_add} bar(s) (adjustment may differ from Yahoo)", flush=True)
-                out[s] = merged
-                if not _needs_retry(merged, expected_session, now):
-                    stats.stooq += 1
+            return s, merged if n_add else None, n_add
+
+        workers = max(1, int(retry_concurrency) or 1)
+        submitted = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for i in range(0, len(todo), workers):
+                if _budget_left(clock, stooq_start, stooq_budget_sec) <= 0:
+                    print(
+                        f"Stooq budget exhausted after {clock() - stooq_start:.0f}s; "
+                        f"submitted {submitted}/{len(todo)}",
+                        flush=True,
+                    )
+                    break
+                chunk = todo[i : i + workers]
+                futs = [pool.submit(_stooq_one, s) for s in chunk]
+                submitted += len(chunk)
+                for fut in futs:
+                    left = _budget_left(clock, stooq_start, stooq_budget_sec)
+                    try:
+                        s, merged, n_add = fut.result(timeout=max(0.1, left + request_timeout_sec))
+                    except Exception:
+                        continue
+                    if not n_add or merged is None:
+                        continue
+                    print(f"  stooq {s}: appended {n_add} bar(s) (adjustment may differ from Yahoo)", flush=True)
+                    out[s] = merged
+                    if not _needs_retry(merged, expected_session, now):
+                        stats.stooq += 1
 
     # --- tally ---
     hist: dict[str, int] = {}

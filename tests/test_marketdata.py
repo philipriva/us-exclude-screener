@@ -1,3 +1,4 @@
+import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -239,3 +240,134 @@ def _multi(mapping: dict):
     if len(mapping) == 1:
         return next(iter(mapping.values()))
     return pd.concat({k: v for k, v in mapping.items()}, axis=1)
+
+
+def test_retry_budget_stops_and_evaluates_freshness():
+    """5d/history retry must stop when the wall-clock budget is gone; gate still runs."""
+    stale = _frame([10, 11], start="2026-11-09")  # ends 11-10
+    fresh = _frame([10, 11, 12], start="2026-11-09")  # ends 11-11
+    clock = {"t": 0.0}
+    calls_5d = {"n": 0}
+
+    def yf_download(tickers, **kw):
+        if kw.get("period") == "5d":
+            calls_5d["n"] += 1
+            clock["t"] += 100.0
+            return _multi({t: fresh for t in tickers})
+        return _multi({t: stale for t in tickers})
+
+    def yf_history(s):
+        clock["t"] += 100.0
+        return fresh
+
+    frames, stats = m.download_daily(
+        ["AAA", "BBB", "CCC"],
+        date(2026, 11, 11),
+        yf_download=yf_download,
+        yf_history=yf_history,
+        stooq_fetch=lambda s: None,
+        sleep=lambda s: None,
+        clock=lambda: clock["t"],
+        retry_budget_sec=50.0,
+        stooq_budget_sec=0.0,
+        retry_concurrency=1,
+        pause_sec=0,
+    )
+    # One 5d batch burns 100s of a 50s budget → no history phase.
+    assert calls_5d["n"] == 1
+    # 5d batch itself is allowed to finish (budget checked at the start of each batch).
+    assert stats.fresh == 3
+    assert "AAA" in frames
+
+
+def test_retry_budget_skips_history_when_already_exhausted():
+    stale = _frame([10, 11], start="2026-11-09")
+    clock = {"t": 0.0}
+    hist_calls = []
+
+    def yf_download(tickers, **kw):
+        if kw.get("period") == "5d":
+            clock["t"] += 100.0
+            return _multi({t: stale for t in tickers})
+        return _multi({t: stale for t in tickers})
+
+    frames, stats = m.download_daily(
+        ["AAA", "BBB", "CCC"],
+        date(2026, 11, 11),
+        yf_download=yf_download,
+        yf_history=lambda s: hist_calls.append(s) or stale,
+        stooq_fetch=lambda s: None,
+        sleep=lambda s: None,
+        clock=lambda: clock["t"],
+        retry_budget_sec=50.0,
+        stooq_budget_sec=0.0,
+        retry_concurrency=1,
+        pause_sec=0,
+    )
+    assert hist_calls == []
+    assert stats.fresh == 0 and stats.stale_after == 3
+    assert set(frames) == {"AAA", "BBB", "CCC"}
+
+
+def test_hanging_history_times_out_and_does_not_block():
+    stale = _frame([10, 11], start="2026-11-09")
+
+    def yf_download(tickers, **kw):
+        return _multi({t: stale for t in tickers})
+
+    def hang(_s):
+        time.sleep(30)
+        return stale
+
+    import time as _t
+    t0 = _t.monotonic()
+    frames, stats = m.download_daily(
+        ["AAA"],
+        date(2026, 11, 11),
+        yf_download=yf_download,
+        yf_history=hang,
+        stooq_fetch=lambda s: None,
+        sleep=lambda s: None,
+        retry_budget_sec=60.0,
+        stooq_budget_sec=0.0,
+        request_timeout_sec=0.3,
+        retry_concurrency=1,
+        pause_sec=0,
+    )
+    elapsed = _t.monotonic() - t0
+    assert elapsed < 5.0, elapsed
+    assert stats.fresh == 0 and stats.stale_after == 1
+    assert "AAA" in frames
+
+
+def test_stooq_budget_stops_after_cap():
+    stale = _frame([10, 11], start="2026-11-09")  # ends 11-10
+    stooq_fresh = _frame([10, 11, 12], start="2026-11-09")  # ends 11-11
+    clock = {"t": 0.0}
+    calls = []
+
+    def yf_download(tickers, **kw):
+        return _multi({t: stale for t in tickers})
+
+    def stooq(s):
+        calls.append(s)
+        clock["t"] += 100.0
+        return stooq_fresh
+
+    frames, stats = m.download_daily(
+        ["AAA", "BBB", "CCC"],
+        date(2026, 11, 11),
+        yf_download=yf_download,
+        yf_history=lambda s: stale,
+        stooq_fetch=stooq,
+        sleep=lambda s: None,
+        clock=lambda: clock["t"],
+        retry_budget_sec=0.0,  # skip yahoo retry; go to stooq with existing prefix
+        stooq_budget_sec=50.0,
+        retry_concurrency=1,
+        pause_sec=0,
+    )
+    # First Stooq call burns 100s of a 50s budget; later symbols skipped.
+    assert calls == ["AAA"]
+    assert stats.stooq == 1
+    assert stats.fresh == 1 and stats.stale_after == 2
