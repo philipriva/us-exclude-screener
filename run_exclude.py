@@ -40,6 +40,8 @@ from marketdata import (
     _merge_yahoo,
     download_daily,
     format_status,
+    massive_available,
+    massive_gap_fill,
     last_bar_date,
     last_complete_us_session_date,
 )
@@ -686,13 +688,18 @@ def main() -> int:
         if last_bar_date(data.get(s)) != expected
     ]
     yahoo_fresh = len(syms) - len(stale_or_missing)
-    retry = stooq = 0
+    retry = stooq = massive = 0
     if stale_or_missing:
-        print(f"stale/missing after main pass: {len(stale_or_missing)}; Yahoo 5d + Stooq gap-fill", flush=True)
+        print(f"stale/missing after main pass: {len(stale_or_missing)}; Yahoo 5d + Massive/Stooq gap-fill", flush=True)
         extra, st = download_daily(stale_or_missing, expected, period="5d", batch_size=50, pause_sec=RETRY_PAUSE_SEC)
-        retry, stooq = st.retry + st.yahoo, st.stooq  # 5d main counts as yahoo-retry
+        retry, stooq, massive = st.retry + st.yahoo, st.stooq, st.massive  # 5d main counts as yahoo-retry
         for s, fr in extra.items():
             data[s] = _merge_yahoo(data.get(s), fr)
+        # Symbols whose 5d retry returned nothing still have main-pass Yahoo
+        # history in ``data``; append the session bar from the (cached) Massive
+        # grouped response. No extra API call for an already-fetched session.
+        if massive_available():
+            massive += massive_gap_fill(data, stale_or_missing, expected)
     fresh_n = sum(1 for s in syms if last_bar_date(data.get(s)) == expected)
     denom_n = len(syms)
     frac = (fresh_n / denom_n) if denom_n else 0.0
@@ -706,6 +713,7 @@ def main() -> int:
             yahoo=yahoo_fresh,
             retry=retry,
             stooq=stooq,
+            massive=massive,
             result="BLOCKED" if not fresh_ok else "WROTE",
         ),
         flush=True,

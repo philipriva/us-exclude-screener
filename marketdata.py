@@ -13,6 +13,15 @@ retried per-symbol / small-batch with period=5d and Ticker.history, then
 Stooq is used ONLY to append the missing latest bar(s) onto existing Yahoo
 history. Stooq never replaces Yahoo history.
 
+Massive (ex-Polygon) gap-fill (Philip 2026-11-14): after the Yahoo retry
+phase and BEFORE Stooq, symbols that already have Yahoo history but whose last
+bar is short of expected_session get the missing session bar(s) appended from
+ONE grouped-daily request per session (whole US market, cached in-process).
+Needs env MASSIVE_API_KEY; missing key / failed request = no-op (fail-soft).
+Massive never replaces Yahoo rows and never creates history for symbols that
+Yahoo returned nothing for. When Massive is available the Stooq budget is
+capped at STOOQ_BUDGET_WITH_MASSIVE_SEC (Stooq is currently blocked).
+
 Adjustment caveat: Stooq OHLC may be unadjusted or adjusted differently from
 Yahoo auto_adjust=True. Gap-filled bars are therefore not guaranteed to be
 on the same adjustment basis as the Yahoo prefix; they are used only so the
@@ -24,6 +33,7 @@ before pip install on GitHub Actions.
 """
 from __future__ import annotations
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
@@ -46,6 +56,11 @@ STOOQ_BUDGET_SEC = 360.0
 RETRY_CONCURRENCY = 8
 MAX_HISTORY_SYMBOLS = 400
 MAX_STOOQ_SYMBOLS = 400
+MASSIVE_GROUPED_URL = "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{day}"
+MASSIVE_TIMEOUT_SEC = 60.0
+MASSIVE_MAX_SESSIONS = 3  # free tier ~5 calls/min: at most 3 grouped requests per process
+STOOQ_BUDGET_WITH_MASSIVE_SEC = 30.0
+_MASSIVE_CACHE: dict = {}
 
 # One-off full-session closures not produced by the standard NYSE rule set.
 # 2025-01-09: National Day of Mourning (President Carter).
@@ -67,6 +82,7 @@ __all__ = [
     "freshness_ok",
     "format_status",
     "download_daily",
+    "massive_gap_fill",
 ]
 
 
@@ -318,6 +334,7 @@ def format_status(
     stooq: int,
     result: str,
     extra: str = "",
+    massive: Optional[int] = None,
 ) -> str:
     frac = (fresh / denom) if denom else 0.0
     parts = [
@@ -327,6 +344,10 @@ def format_status(
         f"yahoo={yahoo}",
         f"retry={retry}",
         f"stooq={stooq}",
+    ]
+    if massive is not None:
+        parts.append(f"massive={massive}")
+    parts += [
         f"result={result}",
     ]
     if extra:
@@ -340,6 +361,7 @@ class DownloadStats:
     yahoo: int = 0
     retry: int = 0
     stooq: int = 0
+    massive: int = 0
     missing: int = 0
     stale_after: int = 0
     fresh: int = 0
@@ -549,6 +571,150 @@ def _append_stooq_gaps(yahoo_df, stooq_df, expected: date):
     return out, len(add_rows)
 
 
+def massive_available() -> bool:
+    return bool(os.environ.get("MASSIVE_API_KEY", "").strip())
+
+
+def _massive_symbol(t: str) -> str:
+    """Massive ticker -> Yahoo-style symbol used by our universes (BRK.B -> BRK-B)."""
+    return str(t).strip().upper().replace(".", "-")
+
+
+def _fetch_massive_grouped(day: date) -> Optional[dict]:
+    """Whole-US-market daily bars for ``day`` from ONE Massive grouped request.
+
+    Returns {yahoo_symbol: {Open, High, Low, Close, Volume}} or None. Cached per
+    process (failures too) so repeated callers never re-hit the rate limit.
+    The API key is sent as a header and never printed.
+    """
+    k = day.isoformat()
+    if k in _MASSIVE_CACHE:
+        return _MASSIVE_CACHE[k]
+    key = os.environ.get("MASSIVE_API_KEY", "").strip()
+    if not key:
+        return None
+    bars = None
+    try:
+        import requests
+
+        resp = requests.get(
+            MASSIVE_GROUPED_URL.format(day=k),
+            params={"adjusted": "true"},
+            headers={"Authorization": f"Bearer {key}", "User-Agent": "marketdata/1.0"},
+            timeout=MASSIVE_TIMEOUT_SEC,
+        )
+        if resp.status_code != 200:
+            print(f"massive grouped {k}: HTTP {resp.status_code}", flush=True)
+        else:
+            js = resp.json()
+            bars = {}
+            for r in js.get("results") or []:
+                t = r.get("T")
+                vals = [r.get(x) for x in ("o", "h", "l", "c")]
+                if not t or any(v is None for v in vals):
+                    continue
+                bars[_massive_symbol(t)] = {
+                    "Open": float(vals[0]),
+                    "High": float(vals[1]),
+                    "Low": float(vals[2]),
+                    "Close": float(vals[3]),
+                    "Volume": float(r.get("v") or 0.0),
+                }
+            print(f"massive grouped {k}: {len(bars)} rows", flush=True)
+            if not bars:
+                bars = None
+    except Exception as e:  # never print the exception text (may contain request details)
+        print(f"massive grouped {k}: {type(e).__name__}", flush=True)
+        bars = None
+    _MASSIVE_CACHE[k] = bars
+    return bars
+
+
+def _sessions_after(last: date, expected: date, limit: int = 15) -> Optional[list[date]]:
+    """NYSE sessions in (last, expected]; None if more than ``limit`` days apart."""
+    if last >= expected:
+        return []
+    if (expected - last).days > limit:
+        return None
+    out = []
+    d = last + timedelta(days=1)
+    while d <= expected:
+        if is_nyse_trading_day(d):
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def massive_gap_fill(
+    frames: dict,
+    symbols: Iterable[str],
+    expected: date,
+    *,
+    now: Optional[datetime] = None,
+    fetch: Optional[Callable] = None,
+    max_sessions: int = MASSIVE_MAX_SESSIONS,
+) -> int:
+    """Append missing session bars from Massive onto EXISTING frames (in place).
+
+    Only symbols with a non-empty frame whose last bar < expected are touched,
+    and only when every session in (last_bar, expected] is among the newest
+    ``max_sessions`` sessions and present in Massive (no gaps, no invented
+    history). Yahoo rows are never replaced. Returns how many symbols became
+    fresh (last bar == expected). Fail-soft: no key / failed fetch -> 0.
+    """
+    if fetch is None:
+        if not massive_available():
+            print("massive gap-fill skipped: MASSIVE_API_KEY not set", flush=True)
+            return 0
+        fetch = _fetch_massive_grouped
+    import pandas as pd
+
+    plan: dict[str, list[date]] = {}
+    for s in symbols:
+        fr = frames.get(s)
+        if fr is None or getattr(fr, "empty", True):
+            continue
+        lb = last_bar_date(fr, now=now)
+        if lb is None or lb >= expected:
+            continue
+        need = _sessions_after(lb, expected)
+        if not need or len(need) > max_sessions:
+            continue
+        plan[s] = need
+    if not plan:
+        return 0
+    days = sorted({d for need in plan.values() for d in need})
+    by_day = {}
+    for d in days:
+        try:
+            by_day[d] = fetch(d)
+        except Exception as e:
+            print(f"massive grouped {d.isoformat()}: {type(e).__name__}", flush=True)
+            by_day[d] = None
+    filled = 0
+    for s, need in plan.items():
+        rows = []
+        for d in need:
+            bars = by_day.get(d)
+            bar = bars.get(s) if bars else None
+            if bar is None:
+                rows = []
+                break
+            rows.append((d, bar))
+        if not rows:
+            continue
+        add = pd.DataFrame([b for _, b in rows], index=pd.to_datetime([d for d, _ in rows]))
+        merged, n_add = _append_stooq_gaps(frames[s], add, expected)
+        if n_add and not _needs_retry(merged, expected, now):
+            frames[s] = merged
+            filled += 1
+    print(
+        f"massive gap-fill: filled {filled}/{len(plan)} stale symbols "
+        f"(sessions {[d.isoformat() for d in days]})",
+        flush=True,
+    )
+    return filled
+
 
 def _prioritize_pending(pending: list[str], out: dict) -> list[str]:
     """Retry stale-with-Yahoo-history first; missing/delisted last."""
@@ -601,6 +767,7 @@ def download_daily(
     yf_download: Optional[Callable] = None,
     yf_history: Optional[Callable] = None,
     stooq_fetch: Optional[Callable] = None,
+    massive_fetch: Optional[Callable] = None,
     sleep: Callable = time.sleep,
     clock: Callable = time.monotonic,
     retry_budget_sec: float = YF_RETRY_BUDGET_SEC,
@@ -776,7 +943,12 @@ def download_daily(
             flush=True,
         )
 
-    # --- 3) Stooq gap-fill only onto existing Yahoo history ---
+    # --- 3) Massive gap-fill (one grouped request per session) onto Yahoo history ---
+    if massive_fetch is not None or massive_available():
+        stats.massive = massive_gap_fill(out, syms, expected_session, now=now, fetch=massive_fetch)
+        stooq_budget_sec = min(stooq_budget_sec, STOOQ_BUDGET_WITH_MASSIVE_SEC)
+
+    # --- 4) Stooq gap-fill only onto existing Yahoo history ---
     still = _prioritize_pending(
         [s for s in syms if s not in out or _needs_retry(out.get(s), expected_session, now)],
         out,
