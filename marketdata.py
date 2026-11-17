@@ -59,6 +59,21 @@ MAX_STOOQ_SYMBOLS = 400
 MASSIVE_GROUPED_URL = "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{day}"
 MASSIVE_TIMEOUT_SEC = 60.0
 MASSIVE_MAX_SESSIONS = 3  # free tier ~5 calls/min: at most 3 grouped requests per process
+# 403 = session grouped file not published yet (2026-11-16: 403 at 08:12 JST,
+# 12,623 rows at 10:28 JST). 429 = rate limit. Strategies are separate (Philip
+# 2026-11-17 / 指原): 429 = short second-level backoff; 403 = minute-level
+# (20 min) until the 10:30 JST hard cutoff, then fall back to Yahoo. Never
+# silently reuse a stale grouped file. In-process 403 retries are capped;
+# the 07:30 routine re-dispatches until the cutoff.
+MASSIVE_429_SLEEP_SEC = (5.0, 15.0, 30.0)
+MASSIVE_429_RETRIES = 3
+MASSIVE_403_SLEEP_SEC = 20 * 60.0
+MASSIVE_403_MAX_RETRIES = 2  # two 20-min waits fit a ~60–75 min job
+MASSIVE_403_CUTOFF_JST = (10, 30)
+JST = ZoneInfo("Asia/Tokyo")
+# Backward-compatible aliases used by older tests / copies.
+MASSIVE_FETCH_RETRIES = MASSIVE_429_RETRIES
+MASSIVE_RETRY_SLEEP_SEC = MASSIVE_429_SLEEP_SEC
 STOOQ_BUDGET_WITH_MASSIVE_SEC = 30.0
 _MASSIVE_CACHE: dict = {}
 
@@ -580,12 +595,36 @@ def _massive_symbol(t: str) -> str:
     return str(t).strip().upper().replace(".", "-")
 
 
-def _fetch_massive_grouped(day: date) -> Optional[dict]:
+def massive_403_cutoff(now: datetime) -> datetime:
+    """10:30 JST on the JST calendar day of ``now`` (tz-aware)."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    j = now.astimezone(JST)
+    h, m = MASSIVE_403_CUTOFF_JST
+    return j.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def _seconds_until_403_cutoff(now: datetime) -> float:
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (massive_403_cutoff(now) - now.astimezone(JST)).total_seconds()
+
+
+def _fetch_massive_grouped(
+    day: date,
+    *,
+    sleep: Callable = time.sleep,
+    now_fn: Optional[Callable] = None,
+    retries_429: int = MASSIVE_429_RETRIES,
+    max_403: int = MASSIVE_403_MAX_RETRIES,
+) -> Optional[dict]:
     """Whole-US-market daily bars for ``day`` from ONE Massive grouped request.
 
     Returns {yahoo_symbol: {Open, High, Low, Close, Volume}} or None. Cached per
-    process (failures too) so repeated callers never re-hit the rate limit.
-    The API key is sent as a header and never printed.
+    process (success and exhausted failures). HTTP 429 is retried with a short
+    second-level backoff. HTTP 403 (file not yet published) is retried every
+    20 minutes until 10:30 JST or ``max_403`` waits, then the caller falls
+    back to Yahoo — never a silent stale fill. The API key is never printed.
     """
     k = day.isoformat()
     if k in _MASSIVE_CACHE:
@@ -593,36 +632,91 @@ def _fetch_massive_grouped(day: date) -> Optional[dict]:
     key = os.environ.get("MASSIVE_API_KEY", "").strip()
     if not key:
         return None
+    clock = now_fn or (lambda: datetime.now(timezone.utc))
     bars = None
+    n429 = 0
+    n403 = 0
     try:
         import requests
 
-        resp = requests.get(
-            MASSIVE_GROUPED_URL.format(day=k),
-            params={"adjusted": "true"},
-            headers={"Authorization": f"Bearer {key}", "User-Agent": "marketdata/1.0"},
-            timeout=MASSIVE_TIMEOUT_SEC,
-        )
-        if resp.status_code != 200:
-            print(f"massive grouped {k}: HTTP {resp.status_code}", flush=True)
-        else:
-            js = resp.json()
-            bars = {}
-            for r in js.get("results") or []:
-                t = r.get("T")
-                vals = [r.get(x) for x in ("o", "h", "l", "c")]
-                if not t or any(v is None for v in vals):
+        while True:
+            try:
+                resp = requests.get(
+                    MASSIVE_GROUPED_URL.format(day=k),
+                    params={"adjusted": "true"},
+                    headers={"Authorization": f"Bearer {key}", "User-Agent": "marketdata/1.0"},
+                    timeout=MASSIVE_TIMEOUT_SEC,
+                )
+            except Exception as e:  # never print the exception text (may contain request details)
+                print(f"massive grouped {k}: {type(e).__name__}", flush=True)
+                n429 += 1
+                if n429 < retries_429:
+                    sleep(MASSIVE_429_SLEEP_SEC[min(n429 - 1, len(MASSIVE_429_SLEEP_SEC) - 1)])
                     continue
-                bars[_massive_symbol(t)] = {
-                    "Open": float(vals[0]),
-                    "High": float(vals[1]),
-                    "Low": float(vals[2]),
-                    "Close": float(vals[3]),
-                    "Volume": float(r.get("v") or 0.0),
-                }
-            print(f"massive grouped {k}: {len(bars)} rows", flush=True)
-            if not bars:
+                print(f"massive grouped {k}: request retries exhausted; falling back to Yahoo", flush=True)
                 bars = None
+                break
+            if resp.status_code == 200:
+                js = resp.json()
+                bars = {}
+                for r in js.get("results") or []:
+                    tkr = r.get("T")
+                    vals = [r.get(x) for x in ("o", "h", "l", "c")]
+                    if not tkr or any(v is None for v in vals):
+                        continue
+                    bars[_massive_symbol(tkr)] = {
+                        "Open": float(vals[0]),
+                        "High": float(vals[1]),
+                        "Low": float(vals[2]),
+                        "Close": float(vals[3]),
+                        "Volume": float(r.get("v") or 0.0),
+                    }
+                print(f"massive grouped {k}: {len(bars)} rows", flush=True)
+                if not bars:
+                    bars = None
+                break
+            print(f"massive grouped {k}: HTTP {resp.status_code}", flush=True)
+            if resp.status_code == 429:
+                n429 += 1
+                if n429 < retries_429:
+                    wait = MASSIVE_429_SLEEP_SEC[min(n429 - 1, len(MASSIVE_429_SLEEP_SEC) - 1)]
+                    print(f"massive grouped {k}: HTTP 429; retry in {wait:.0f}s", flush=True)
+                    sleep(wait)
+                    continue
+                print(f"massive grouped {k}: 429 retries exhausted; falling back to Yahoo", flush=True)
+                bars = None
+                break
+            if resp.status_code == 403:
+                now = clock()
+                left = _seconds_until_403_cutoff(now)
+                if left <= 0:
+                    print(
+                        f"massive grouped {k}: HTTP 403 after 10:30 JST cutoff; "
+                        f"falling back to Yahoo (no stale fill)",
+                        flush=True,
+                    )
+                    bars = None
+                    break
+                if n403 >= max_403:
+                    print(
+                        f"massive grouped {k}: 403 retries exhausted before cutoff; "
+                        f"falling back to Yahoo",
+                        flush=True,
+                    )
+                    bars = None
+                    break
+                wait = min(MASSIVE_403_SLEEP_SEC, left)
+                n403 += 1
+                print(
+                    f"massive grouped {k}: HTTP 403 (session file may be unpublished); "
+                    f"retry in {wait:.0f}s (cutoff 10:30 JST)",
+                    flush=True,
+                )
+                sleep(wait)
+                continue
+            print(f"massive grouped {k}: unexpected HTTP {resp.status_code}; falling back to Yahoo", flush=True)
+            bars = None
+            break
     except Exception as e:  # never print the exception text (may contain request details)
         print(f"massive grouped {k}: {type(e).__name__}", flush=True)
         bars = None
@@ -684,6 +778,10 @@ def massive_gap_fill(
     if not plan:
         return 0
     days = sorted({d for need in plan.values() for d in need})
+    # Expected session first: every fill needs it, and a 403 there means no
+    # symbol can become fresh. Skip older-day calls if expected is unavailable.
+    if expected in days:
+        days = [expected] + [d for d in days if d != expected]
     by_day = {}
     for d in days:
         try:
@@ -691,6 +789,8 @@ def massive_gap_fill(
         except Exception as e:
             print(f"massive grouped {d.isoformat()}: {type(e).__name__}", flush=True)
             by_day[d] = None
+        if d == expected and not by_day[d]:
+            break
     filled = 0
     for s, need in plan.items():
         rows = []
