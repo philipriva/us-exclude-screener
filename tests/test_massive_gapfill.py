@@ -132,3 +132,96 @@ def test_status_line_massive_optional():
     kw = dict(session=EXP, writer="x", fresh=9, denom=10, yahoo=8, retry=0, stooq=0, result="WROTE")
     assert "massive=" not in m.format_status(**kw)
     assert "stooq=0 massive=5 result=WROTE" in m.format_status(massive=5, **kw)
+
+
+def test_expected_session_fetched_first_and_skips_older_if_unavailable():
+    """Every fill needs the expected session; do not spend free-tier calls on
+    older days when that file is missing (e.g. HTTP 403 not-yet-published)."""
+    frames = {"AAA": _frame("2026-11-11")}
+    calls = []
+
+    def fetch(d):
+        calls.append(d)
+        return None
+
+    n = m.massive_gap_fill(frames, ["AAA"], EXP, now=NOW, fetch=fetch)
+    assert n == 0
+    assert calls == [EXP]
+    assert m.last_bar_date(frames["AAA"], now=NOW) == date(2026, 11, 11)
+
+
+def test_expected_session_fetched_before_older_days_on_success():
+    frames = {"AAA": _frame("2026-11-11")}
+    calls = []
+
+    def fetch(d):
+        calls.append(d)
+        return {"AAA": _bar(3.0 if d == EXP else 2.0)}
+
+    n = m.massive_gap_fill(frames, ["AAA"], EXP, now=NOW, fetch=fetch)
+    assert n == 1
+    assert calls[0] == EXP
+    assert date(2026, 11, 12) in calls
+    assert m.last_bar_date(frames["AAA"], now=NOW) == EXP
+
+
+def test_fetch_retries_403_then_succeeds(monkeypatch):
+    import requests
+
+    m._MASSIVE_CACHE.clear()
+    monkeypatch.setenv("MASSIVE_API_KEY", "k")
+    hits = []
+
+    class R:
+        def __init__(self, code, payload=None):
+            self.status_code = code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    seq = [
+        R(403),
+        R(403),
+        R(200, {"results": [{"T": "AAA", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 7}]}),
+    ]
+
+    def get(url, **kw):
+        hits.append(url)
+        return seq[len(hits) - 1]
+
+    sleeps = []
+    monkeypatch.setattr(requests, "get", get)
+    out = m._fetch_massive_grouped(EXP, sleep=sleeps.append)
+    assert out["AAA"]["Close"] == 1.5
+    assert len(hits) == 3 and sleeps == [5.0, 15.0]
+    # success is cached — no further HTTP
+    assert m._fetch_massive_grouped(EXP, sleep=sleeps.append) is out
+    assert len(hits) == 3
+    m._MASSIVE_CACHE.clear()
+
+
+def test_fetch_retries_429_and_exhausted_403_is_cached(monkeypatch):
+    import requests
+
+    m._MASSIVE_CACHE.clear()
+    monkeypatch.setenv("MASSIVE_API_KEY", "k")
+    hits = []
+
+    class R:
+        status_code = 403
+
+        def json(self):
+            return {}
+
+    def get(url, **kw):
+        hits.append(url)
+        return R()
+
+    sleeps = []
+    monkeypatch.setattr(requests, "get", get)
+    assert m._fetch_massive_grouped(EXP, sleep=sleeps.append, retries=3) is None
+    assert len(hits) == 3 and sleeps == [5.0, 15.0]
+    assert m._fetch_massive_grouped(EXP, sleep=sleeps.append) is None
+    assert len(hits) == 3  # cached failure
+    m._MASSIVE_CACHE.clear()

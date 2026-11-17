@@ -59,6 +59,10 @@ MAX_STOOQ_SYMBOLS = 400
 MASSIVE_GROUPED_URL = "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{day}"
 MASSIVE_TIMEOUT_SEC = 60.0
 MASSIVE_MAX_SESSIONS = 3  # free tier ~5 calls/min: at most 3 grouped requests per process
+# 403 is often "session file not published yet" (seen 2026-11-16 18:12 ET → 200 by 20:28 ET).
+MASSIVE_RETRY_STATUSES = frozenset({403, 429})
+MASSIVE_FETCH_RETRIES = 3
+MASSIVE_RETRY_SLEEP_SEC = (5.0, 15.0, 30.0)
 STOOQ_BUDGET_WITH_MASSIVE_SEC = 30.0
 _MASSIVE_CACHE: dict = {}
 
@@ -580,12 +584,19 @@ def _massive_symbol(t: str) -> str:
     return str(t).strip().upper().replace(".", "-")
 
 
-def _fetch_massive_grouped(day: date) -> Optional[dict]:
+def _fetch_massive_grouped(
+    day: date,
+    *,
+    sleep: Callable = time.sleep,
+    retries: int = MASSIVE_FETCH_RETRIES,
+) -> Optional[dict]:
     """Whole-US-market daily bars for ``day`` from ONE Massive grouped request.
 
     Returns {yahoo_symbol: {Open, High, Low, Close, Volume}} or None. Cached per
-    process (failures too) so repeated callers never re-hit the rate limit.
-    The API key is sent as a header and never printed.
+    process (success and exhausted failures) so repeated callers never re-hit
+    the rate limit. HTTP 403/429 are retried with backoff before being cached
+    as a failure: 403 can mean the session file is not published yet. The API
+    key is sent as a header and never printed.
     """
     k = day.isoformat()
     if k in _MASSIVE_CACHE:
@@ -594,35 +605,50 @@ def _fetch_massive_grouped(day: date) -> Optional[dict]:
     if not key:
         return None
     bars = None
+    attempts = max(1, int(retries))
     try:
         import requests
 
-        resp = requests.get(
-            MASSIVE_GROUPED_URL.format(day=k),
-            params={"adjusted": "true"},
-            headers={"Authorization": f"Bearer {key}", "User-Agent": "marketdata/1.0"},
-            timeout=MASSIVE_TIMEOUT_SEC,
-        )
-        if resp.status_code != 200:
-            print(f"massive grouped {k}: HTTP {resp.status_code}", flush=True)
-        else:
-            js = resp.json()
-            bars = {}
-            for r in js.get("results") or []:
-                t = r.get("T")
-                vals = [r.get(x) for x in ("o", "h", "l", "c")]
-                if not t or any(v is None for v in vals):
+        for i in range(attempts):
+            try:
+                resp = requests.get(
+                    MASSIVE_GROUPED_URL.format(day=k),
+                    params={"adjusted": "true"},
+                    headers={"Authorization": f"Bearer {key}", "User-Agent": "marketdata/1.0"},
+                    timeout=MASSIVE_TIMEOUT_SEC,
+                )
+            except Exception as e:  # never print the exception text (may contain request details)
+                print(f"massive grouped {k}: {type(e).__name__}", flush=True)
+                if i + 1 < attempts:
+                    sleep(MASSIVE_RETRY_SLEEP_SEC[min(i, len(MASSIVE_RETRY_SLEEP_SEC) - 1)])
                     continue
-                bars[_massive_symbol(t)] = {
-                    "Open": float(vals[0]),
-                    "High": float(vals[1]),
-                    "Low": float(vals[2]),
-                    "Close": float(vals[3]),
-                    "Volume": float(r.get("v") or 0.0),
-                }
-            print(f"massive grouped {k}: {len(bars)} rows", flush=True)
-            if not bars:
                 bars = None
+                break
+            if resp.status_code == 200:
+                js = resp.json()
+                bars = {}
+                for r in js.get("results") or []:
+                    tkr = r.get("T")
+                    vals = [r.get(x) for x in ("o", "h", "l", "c")]
+                    if not tkr or any(v is None for v in vals):
+                        continue
+                    bars[_massive_symbol(tkr)] = {
+                        "Open": float(vals[0]),
+                        "High": float(vals[1]),
+                        "Low": float(vals[2]),
+                        "Close": float(vals[3]),
+                        "Volume": float(r.get("v") or 0.0),
+                    }
+                print(f"massive grouped {k}: {len(bars)} rows", flush=True)
+                if not bars:
+                    bars = None
+                break
+            print(f"massive grouped {k}: HTTP {resp.status_code}", flush=True)
+            if resp.status_code in MASSIVE_RETRY_STATUSES and i + 1 < attempts:
+                sleep(MASSIVE_RETRY_SLEEP_SEC[min(i, len(MASSIVE_RETRY_SLEEP_SEC) - 1)])
+                continue
+            bars = None
+            break
     except Exception as e:  # never print the exception text (may contain request details)
         print(f"massive grouped {k}: {type(e).__name__}", flush=True)
         bars = None
@@ -684,6 +710,10 @@ def massive_gap_fill(
     if not plan:
         return 0
     days = sorted({d for need in plan.values() for d in need})
+    # Expected session first: every fill needs it, and a 403 there means no
+    # symbol can become fresh. Skip older-day calls if expected is unavailable.
+    if expected in days:
+        days = [expected] + [d for d in days if d != expected]
     by_day = {}
     for d in days:
         try:
@@ -691,6 +721,8 @@ def massive_gap_fill(
         except Exception as e:
             print(f"massive grouped {d.isoformat()}: {type(e).__name__}", flush=True)
             by_day[d] = None
+        if d == expected and not by_day[d]:
+            break
     filled = 0
     for s, need in plan.items():
         rows = []
