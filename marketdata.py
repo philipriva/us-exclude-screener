@@ -59,10 +59,21 @@ MAX_STOOQ_SYMBOLS = 400
 MASSIVE_GROUPED_URL = "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/{day}"
 MASSIVE_TIMEOUT_SEC = 60.0
 MASSIVE_MAX_SESSIONS = 3  # free tier ~5 calls/min: at most 3 grouped requests per process
-# 403 is often "session file not published yet" (seen 2026-11-16 18:12 ET → 200 by 20:28 ET).
-MASSIVE_RETRY_STATUSES = frozenset({403, 429})
-MASSIVE_FETCH_RETRIES = 3
-MASSIVE_RETRY_SLEEP_SEC = (5.0, 15.0, 30.0)
+# 403 = session grouped file not published yet (2026-11-16: 403 at 08:12 JST,
+# 12,623 rows at 10:28 JST). 429 = rate limit. Strategies are separate (Philip
+# 2026-11-17 / 指原): 429 = short second-level backoff; 403 = minute-level
+# (20 min) until the 10:30 JST hard cutoff, then fall back to Yahoo. Never
+# silently reuse a stale grouped file. In-process 403 retries are capped;
+# the 07:30 routine re-dispatches until the cutoff.
+MASSIVE_429_SLEEP_SEC = (5.0, 15.0, 30.0)
+MASSIVE_429_RETRIES = 3
+MASSIVE_403_SLEEP_SEC = 20 * 60.0
+MASSIVE_403_MAX_RETRIES = 2  # two 20-min waits fit a ~60–75 min job
+MASSIVE_403_CUTOFF_JST = (10, 30)
+JST = ZoneInfo("Asia/Tokyo")
+# Backward-compatible aliases used by older tests / copies.
+MASSIVE_FETCH_RETRIES = MASSIVE_429_RETRIES
+MASSIVE_RETRY_SLEEP_SEC = MASSIVE_429_SLEEP_SEC
 STOOQ_BUDGET_WITH_MASSIVE_SEC = 30.0
 _MASSIVE_CACHE: dict = {}
 
@@ -584,19 +595,36 @@ def _massive_symbol(t: str) -> str:
     return str(t).strip().upper().replace(".", "-")
 
 
+def massive_403_cutoff(now: datetime) -> datetime:
+    """10:30 JST on the JST calendar day of ``now`` (tz-aware)."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    j = now.astimezone(JST)
+    h, m = MASSIVE_403_CUTOFF_JST
+    return j.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def _seconds_until_403_cutoff(now: datetime) -> float:
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (massive_403_cutoff(now) - now.astimezone(JST)).total_seconds()
+
+
 def _fetch_massive_grouped(
     day: date,
     *,
     sleep: Callable = time.sleep,
-    retries: int = MASSIVE_FETCH_RETRIES,
+    now_fn: Optional[Callable] = None,
+    retries_429: int = MASSIVE_429_RETRIES,
+    max_403: int = MASSIVE_403_MAX_RETRIES,
 ) -> Optional[dict]:
     """Whole-US-market daily bars for ``day`` from ONE Massive grouped request.
 
     Returns {yahoo_symbol: {Open, High, Low, Close, Volume}} or None. Cached per
-    process (success and exhausted failures) so repeated callers never re-hit
-    the rate limit. HTTP 403/429 are retried with backoff before being cached
-    as a failure: 403 can mean the session file is not published yet. The API
-    key is sent as a header and never printed.
+    process (success and exhausted failures). HTTP 429 is retried with a short
+    second-level backoff. HTTP 403 (file not yet published) is retried every
+    20 minutes until 10:30 JST or ``max_403`` waits, then the caller falls
+    back to Yahoo — never a silent stale fill. The API key is never printed.
     """
     k = day.isoformat()
     if k in _MASSIVE_CACHE:
@@ -604,12 +632,14 @@ def _fetch_massive_grouped(
     key = os.environ.get("MASSIVE_API_KEY", "").strip()
     if not key:
         return None
+    clock = now_fn or (lambda: datetime.now(timezone.utc))
     bars = None
-    attempts = max(1, int(retries))
+    n429 = 0
+    n403 = 0
     try:
         import requests
 
-        for i in range(attempts):
+        while True:
             try:
                 resp = requests.get(
                     MASSIVE_GROUPED_URL.format(day=k),
@@ -619,9 +649,11 @@ def _fetch_massive_grouped(
                 )
             except Exception as e:  # never print the exception text (may contain request details)
                 print(f"massive grouped {k}: {type(e).__name__}", flush=True)
-                if i + 1 < attempts:
-                    sleep(MASSIVE_RETRY_SLEEP_SEC[min(i, len(MASSIVE_RETRY_SLEEP_SEC) - 1)])
+                n429 += 1
+                if n429 < retries_429:
+                    sleep(MASSIVE_429_SLEEP_SEC[min(n429 - 1, len(MASSIVE_429_SLEEP_SEC) - 1)])
                     continue
+                print(f"massive grouped {k}: request retries exhausted; falling back to Yahoo", flush=True)
                 bars = None
                 break
             if resp.status_code == 200:
@@ -644,9 +676,45 @@ def _fetch_massive_grouped(
                     bars = None
                 break
             print(f"massive grouped {k}: HTTP {resp.status_code}", flush=True)
-            if resp.status_code in MASSIVE_RETRY_STATUSES and i + 1 < attempts:
-                sleep(MASSIVE_RETRY_SLEEP_SEC[min(i, len(MASSIVE_RETRY_SLEEP_SEC) - 1)])
+            if resp.status_code == 429:
+                n429 += 1
+                if n429 < retries_429:
+                    wait = MASSIVE_429_SLEEP_SEC[min(n429 - 1, len(MASSIVE_429_SLEEP_SEC) - 1)]
+                    print(f"massive grouped {k}: HTTP 429; retry in {wait:.0f}s", flush=True)
+                    sleep(wait)
+                    continue
+                print(f"massive grouped {k}: 429 retries exhausted; falling back to Yahoo", flush=True)
+                bars = None
+                break
+            if resp.status_code == 403:
+                now = clock()
+                left = _seconds_until_403_cutoff(now)
+                if left <= 0:
+                    print(
+                        f"massive grouped {k}: HTTP 403 after 10:30 JST cutoff; "
+                        f"falling back to Yahoo (no stale fill)",
+                        flush=True,
+                    )
+                    bars = None
+                    break
+                if n403 >= max_403:
+                    print(
+                        f"massive grouped {k}: 403 retries exhausted before cutoff; "
+                        f"falling back to Yahoo",
+                        flush=True,
+                    )
+                    bars = None
+                    break
+                wait = min(MASSIVE_403_SLEEP_SEC, left)
+                n403 += 1
+                print(
+                    f"massive grouped {k}: HTTP 403 (session file may be unpublished); "
+                    f"retry in {wait:.0f}s (cutoff 10:30 JST)",
+                    flush=True,
+                )
+                sleep(wait)
                 continue
+            print(f"massive grouped {k}: unexpected HTTP {resp.status_code}; falling back to Yahoo", flush=True)
             bars = None
             break
     except Exception as e:  # never print the exception text (may contain request details)

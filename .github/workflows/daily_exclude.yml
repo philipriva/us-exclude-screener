@@ -2,17 +2,13 @@ name: Daily Exclude Screener (11 gates → Sheets)
 
 on:
   schedule:
-    # GitHub Actions cron is UTC only (no CRON_TZ).
-    # Staggered after Daily 06:30, CDEF ~07:05, and Zhuli 08:33 JST
-    # (~35 min full-universe Yahoo job). Finish is after the old 09:00 HKT
-    # target; morning + late backups still cover a missed primary.
-    # During EST (UTC-5) 09:13 JST is 19:13 ET (close+3h13).
-    - cron: "13 0 * * 2-6"
-    # Mid backups: 12:58 / 13:34 JST Tue–Sat (offset from Zhuli/Strong mids).
-    - cron: "58 3 * * 2-6"
-    - cron: "34 4 * * 2-6"
-    # Late backup 17:42 JST Tue–Sat (staggered 15:00 Yahoo ladder).
-    - cron: "42 8 * * 2-6"
+# Primary trigger is the 07:30 JST routine (workflow_dispatch), approved
+# 2026-11-17 (Philip / 指原). GitHub schedule is a midday backup only:
+# odd minutes, Tue–Sat, staggered so writers do not share a Yahoo pull.
+# Skip-if-session-already-succeeded makes this a no-op after a successful
+# morning run. Do not add morning crons; GitHub schedule has no SLA.
+    # Midday backup: 13:41 JST Tue–Sat = `41 4 * * 2-6` UTC.
+    - cron: "41 4 * * 2-6"
   workflow_dispatch:
 
 permissions:
