@@ -38,6 +38,7 @@ import yfinance as yf
 from marketdata import (
     MIN_FRESH_FRAC,
     _merge_yahoo,
+    bar_date,
     download_daily,
     format_status,
     massive_available,
@@ -139,7 +140,7 @@ def ny_now() -> datetime:
 
 def drop_forming(d: pd.DataFrame) -> pd.DataFrame:
     now = ny_now()
-    last = pd.Timestamp(d.index[-1]).date()
+    last = bar_date(d.index[-1])
     if last == now.date() and (now.hour, now.minute) < (16, 15):
         return d.iloc[:-1]
     return d
