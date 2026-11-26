@@ -3,12 +3,12 @@ name: Daily Exclude Screener (11 gates → Sheets)
 on:
   schedule:
 # Primary trigger is the 07:30 JST routine (workflow_dispatch), approved
-# 2026-11-17 (Philip / 指原). Morning crons are an independent trigger
-# layer approved by Philip 2026-11-26, not the sole clock; the dispatcher
-# remains the timing guarantee. Midday backup cron is retained.
-# Odd minutes, Tue–Sat, staggered so writers do not share a Yahoo pull.
-# Skip-if-session-already-succeeded makes a later schedule trigger a no-op
-# after a successful run. GitHub schedule has no SLA.
+# 2026-11-17 (Philip / 指原). GitHub schedule is a midday backup only:
+# odd minutes, Tue–Sat, staggered so writers do not share a Yahoo pull.
+# Skip-if-session-already-succeeded makes this a no-op after a successful
+# morning run. Morning crons added 2026-11-26 (Philip decoupling decision):
+# an independent trigger layer only — GitHub schedule has no SLA, so the
+# routine dispatch remains the punctuality guarantee.
     # Morning trigger: 08:31 JST Tue–Sat = `31 23 * * 1-5` UTC.
     - cron: "31 23 * * 1-5"
     # Midday backup: 13:41 JST Tue–Sat = `41 4 * * 2-6` UTC.
